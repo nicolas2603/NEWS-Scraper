@@ -5,9 +5,6 @@
 
 function Get-SearxngSettingsContent {
     return @'
-# SearXNG settings pour NEWS Scraper (usage interne, sans authentification)
-# Reference : https://docs.searxng.org/admin/settings/settings.html
-
 use_default_settings: true
 
 general:
@@ -18,76 +15,73 @@ general:
   contact_url: false
 
 search:
-  # Niveau de safe search : 0=off, 1=moderate, 2=strict
   safe_search: 0
   autocomplete: ''
   default_lang: 'fr'
-  # Activer le format JSON pour l utilisation par l agent (desactive par defaut)
   formats:
     - html
     - json
 
 server:
-  # Clef fixe : instance privee sur reseau Docker interne, jamais exposee au web
   secret_key: "news-scraper-searxng-internal-key-change-if-needed"
-  # Limiter desactive : usage interne, pas d abus a craindre
   limiter: false
   image_proxy: false
-  # Acces depuis le reseau Docker : autoriser toutes origines internes
   method: "GET"
 
 ui:
   static_use_hash: true
   default_theme: simple
 
-# Moteurs actives pour l agregation.
+# Moteurs actifs :
 #
-# Choix volontairement restreint a Bing + Mojeek :
-#  - Bing = le plus tolerant aux scrapers et le plus large couverture FR.
-#  - Mojeek = independant (pas de dependance sur Google/Bing), pas de quota
-#    aggressif sur usage modere. Backup utile.
+#   Bing    : large couverture FR, fiable, peu agressif sur le rate-limiting.
+#   DDG     : bon recall FR, tolere ~30 req/min a 3s d intervalle.
+#   Qwant   : moteur francais, meilleure couverture presse regionale FR.
+#   Yahoo   : index proche de Bing, resultats complementaires.
+#   Brave   : bon index FR ; suspended_time possible sous forte charge,
+#             SearXNG bascule alors sur les autres moteurs automatiquement.
+#   Google  : meilleur recall global mais bannit les instances SearXNG rapidement.
+#             Desactiver (disabled: true) si CAPTCHA ou erreurs recurrentes.
 #
-# Volontairement DESACTIVES :
-#  - Google : ban tres rapide via SearXNG (CAPTCHA agressif).
-#  - DuckDuckGo : ban rapidement quand on enchaine plus de quelques dizaines
-#    de requetes / heure depuis la meme IP. Cause majeure de l indisponibilite
-#    SearXNG observee en production.
-#  - Qwant : suspended_time=180 frequent.
-#  - Startpage : CAPTCHA frequent.
-#  - Brave : suspended_time=180 frequent.
-#
-# Pour reactiver un moteur (sciemment), passer 'disabled: false'.
+# Volume : top 20 sources x 5 communes x 3s = ~300s (5 min)
 engines:
   - name: bing
     disabled: false
     timeout: 6.0
-  - name: mojeek
-    disabled: true
-    timeout: 6.0
-  - name: google
-    disabled: true
-    timeout: 6.0
+
   - name: duckduckgo
-    disabled: true
-    timeout: 6.0
-  - name: qwant
-    disabled: true
-    timeout: 6.0
-  - name: startpage
-    disabled: true
-    timeout: 6.0
-  - name: brave
-    disabled: true
-    timeout: 6.0
-  - name: karmasearch
-    disabled: true
-    timeout: 6.0
-  - name: wikipedia
-    disabled: true
+    disabled: false
     timeout: 6.0
 
+  - name: qwant
+    disabled: false
+    timeout: 6.0
+
+  - name: yahoo
+    disabled: false
+    timeout: 6.0
+
+  - name: brave
+    disabled: false
+    timeout: 6.0
+
+  - name: google
+    disabled: false
+    timeout: 6.0
+
+  - name: startpage
+    disabled: true
+
+  - name: mojeek
+    disabled: true
+
+  - name: karmasearch
+    disabled: true
+
+  - name: wikipedia
+    disabled: true
+
 outgoing:
-  # Delai max d une requete vers un moteur externe
   request_timeout: 6.0
   max_request_timeout: 15.0
   pool_connections: 100

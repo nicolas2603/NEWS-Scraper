@@ -209,7 +209,7 @@ function Show-Menu {
     Write-Host "   " -NoNewline; Write-Host "6." -ForegroundColor Cyan -NoNewline
     Write-Host " Afficher les logs" -ForegroundColor White
     Write-Host "   " -NoNewline; Write-Host "0." -ForegroundColor Red -NoNewline
-    Write-Host " Reinitialiser  (DANGER - supprime le schema enr_agent)" -ForegroundColor White
+    Write-Host " Reinitialiser  (DANGER - supprime les donnees)" -ForegroundColor White
     Write-Host ""
     Write-Host "   " -NoNewline; Write-Host "Q." -ForegroundColor DarkGray -NoNewline
     Write-Host " Quitter" -ForegroundColor DarkGray

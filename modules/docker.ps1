@@ -247,7 +247,7 @@ function Reset-Stack {
     Write-Host "   - Supprimer les volumes NEWS Scraper (Redis)" -ForegroundColor Yellow
     Write-Host "   - Supprimer le schema 'news' dans la base MRAE" -ForegroundColor Yellow
     Write-Host ""
-    Write-Warn "Les donnees MRAE (schema mrae, scraper) sont PRESERVEES."
+    Write-Warn "Les donnees MRAE (schema mrae, scraper, sig) sont PRESERVEES."
     Write-Host ""
 
     if ((Read-Host "  Tapez CONFIRMER pour continuer") -ne "CONFIRMER") {

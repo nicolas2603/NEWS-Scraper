@@ -43,38 +43,37 @@ function Get-AgentMainPyContent {
     return @'
 # -*- coding: utf-8 -*-
 """
-NEWS Scraper -- Agent de recherche ENR (etape 4b-1)
+NEWS Scraper -- Agent de recherche ENR
 
-Boucle principale :
-  1. Attend un job dans Redis (BRPOP news:queue, bloquant)
-  2. Passe le job en 'processing' et l'enrichit dans Redis
-  3. Consulte news.get_best_sources() pour recuperer les sources
-     pertinentes pour le (dept, enr_type) demande.
-  4. Resout la liste des communes cibles dans le rayon demande via
-     news.get_communes_in_radius() (fonction PostGIS basee sur sig.communes).
-  5. Pour chaque source, collecte les URLs candidates :
-       - source interne (is_internal)  -> requete SQL directe sur mrae.avis
-       - sinon                         -> recherche SearXNG parallelisee.
-  6. Fetch des URLs (HTML via trafilatura, PDF via Tika) avec cache TTL 30 j.
-  7. Pre-extraction regex : pour chaque URL, detection des mots-cles ENR,
-     de la commune cible, et extraction regex de (puissance, superficie,
-     porteur, date). Classement en :
-       - not_relevant      : pas un projet ENR dans la zone
-       - extracted_direct  : au moins 2 signaux regex trouves -> candidat direct
-       - needs_llm         : pertinent mais incomplet -> sera traite en 4b-2
-       - internal          : avis MRAE, metadonnees deja completes
-  8. Passe le job en 'done' avec URLs + stats fetch + stats extraction.
-
-Les etapes suivantes : 4b-2 (LLM cible sur needs_llm), 4c (consolidation LLM).
+Pipeline :
+  Phase 1  : mrae.avis        SQL direct                     -> candidats internal
+  Phase 2  : crawl_index      96 prefectures DSFR            -> candidats crawl
+  Phase 3  : searxng_site     top N sources x 5 communes     -> candidats searxng
+  Phase 4a : fetch            HTML/PDF, cache TTL 30j
+  Phase 4b : extraction regex puissance, surface, porteur, date, statut, resume
+  Phase 5  : filtre ENR       photovoltaique / agrivoltaique / eolien
+  Phase 6  : consolidation    N sources -> 1 projet
+  Phase 7  : LLM optionnel    resume enrichi post-consolidation
+  Phase 8  : export CSV       separateur ; , encodage utf-8-sig
 """
+
+# ==============================================================================
+#  1. IMPORTS
+# ==============================================================================
+
 import os
 import json
+import re
 import signal
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from threading import Lock, Semaphore
 from typing import List, Optional
+from urllib.parse import urlparse
+
 import httpx
 import redis
 import psycopg2
@@ -82,7 +81,7 @@ from psycopg2.extras import RealDictCursor
 from loguru import logger
 
 # ==============================================================================
-#  Configuration
+#  2. CONFIGURATION
 # ==============================================================================
 
 REDIS_URL   = os.getenv("REDIS_URL", "redis://news_redis:6379/0")
@@ -95,25 +94,21 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 QUEUE_KEY         = "news:queue"
 JOB_KEY_PREFIX    = "news:job:"
 JOB_TTL_DAYS      = 7
-BRPOP_TIMEOUT_SEC = 5       # cycle court pour pouvoir traiter SIGTERM proprement
+BRPOP_TIMEOUT_SEC = 5
 
 # --- SearXNG ------------------------------------------------------------------
-# Strategie anti rate-limit : 1 requete a la fois + delai inter-requetes + cache 24h.
-# Pour un job sur N communes x M sources, le debit en sortie est donc capped a
-# 1 req / (SEARXNG_QUERY_DELAY_SEC) = ~30 req/min en regime nominal.
-SEARXNG_URL              = os.getenv("SEARXNG_URL", "http://news_searxng:8080")
-SEARXNG_TIMEOUT_SEC      = 15
-SEARXNG_MAX_RESULTS      = 5      # urls gardees par requete
-SEARXNG_CONCURRENCY      = int(os.getenv("SEARXNG_CONCURRENCY", "1"))
-SEARXNG_QUERY_DELAY_SEC  = float(os.getenv("SEARXNG_QUERY_DELAY_SEC", "2"))
-SEARXNG_CACHE_TTL_HOURS  = int(os.getenv("SEARXNG_CACHE_TTL_HOURS", "24"))
+SEARXNG_URL             = os.getenv("SEARXNG_URL", "http://news_searxng:8080")
+SEARXNG_TIMEOUT_SEC     = 15
+SEARXNG_MAX_RESULTS     = 5
+SEARXNG_CONCURRENCY     = int(os.getenv("SEARXNG_CONCURRENCY", "1"))
+SEARXNG_QUERY_DELAY_SEC = float(os.getenv("SEARXNG_QUERY_DELAY_SEC", "3"))
+SEARXNG_CACHE_TTL_HOURS = int(os.getenv("SEARXNG_CACHE_TTL_HOURS", "24"))
 
-# --- Selection des communes cibles ------------------------------------------
-# 0 = pas de limite (prend toutes les communes du rayon).
-# Une valeur >0 tronque a N communes les plus proches.
-MAX_COMMUNES_PER_JOB = int(os.getenv("MAX_COMMUNES_PER_JOB", "0"))
+# Phase 3 SearXNG : limiter sources et communes pour rester < 10 min
+SEARXNG_MAX_SOURCES  = int(os.getenv("SEARXNG_MAX_SOURCES", "20"))
+SEARXNG_MAX_COMMUNES = int(os.getenv("SEARXNG_MAX_COMMUNES", "5"))
 
-# --- Fetch & extraction contenu ---------------------------------------------
+# --- Fetch & cache -----------------------------------------------------------
 TIKA_URL             = os.getenv("TIKA_URL", "http://mrae_tika:9998")
 FETCH_CONCURRENCY    = int(os.getenv("FETCH_CONCURRENCY", "10"))
 FETCH_PER_DOMAIN_MAX = int(os.getenv("FETCH_PER_DOMAIN_MAX", "2"))
@@ -121,9 +116,14 @@ FETCH_TIMEOUT_SEC    = int(os.getenv("FETCH_TIMEOUT_SEC", "15"))
 FETCH_TEXT_MAX_CHARS = int(os.getenv("FETCH_TEXT_MAX_CHARS", "50000"))
 URL_CACHE_TTL_DAYS   = int(os.getenv("URL_CACHE_TTL_DAYS", "30"))
 
-# User-Agent realiste pour les fetchs HTTP (sites institutionnels et presse).
-# Quelques sites comme Ouest-France ou les prefectures bloquent les UA
-# 'python-httpx/...' par defaut.
+MAX_COMMUNES_PER_JOB = int(os.getenv("MAX_COMMUNES_PER_JOB", "0"))
+
+# --- LLM normalisation des noms de projets (mrae_ollama partage) -------------
+OLLAMA_HOST          = os.getenv("OLLAMA_HOST",   "http://mrae_ollama:11434")
+OLLAMA_MODEL         = os.getenv("OLLAMA_MODEL",  "qwen2.5:7b")
+OLLAMA_TIMEOUT_NAMES = int(os.getenv("OLLAMA_TIMEOUT_NAMES", "600"))
+OLLAMA_ENABLED    = os.getenv("OLLAMA_ENABLED", "false").lower() == "true"
+
 _UA_CHROME = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -131,90 +131,115 @@ _UA_CHROME = (
 )
 
 # ==============================================================================
-#  Mapping departement -> region administrative (metropole + DOM)
-#  Les noms sans accent correspondent au seed de source_coverage.region_name.
+#  3. CONSTANTES METIER
+#     Types ENR cibles, mots-cles, patterns statut, expressions regulieres.
+# ==============================================================================
+
+# --- Labels et types ENR ------------------------------------------------------
+ENR_LABELS = {
+    "photovoltaique": "photovoltaique",
+    "agrivoltaique":  "agrivoltaique",
+    "eolien":         "eolien",
+}
+
+ENR_TYPES_TARGET = {"photovoltaique", "agrivoltaique", "eolien"}
+
+ENR_KEYWORDS = {
+    "photovoltaique": ["photovoltaique","photovoltaiques","centrale solaire","parc solaire",
+                       "centrale pv","centrale photovoltaique"],
+    "agrivoltaique":  ["agrivoltaique","agrivoltaiques","agrivoltaisme","agri-pv","agripv"],
+    "eolien":         ["eolien","eolienne","eoliennes","parc eolien","turbine eolienne"],
+}
+
+ENR_KEYWORDS_ALL    = [k for kws in ENR_KEYWORDS.values() for k in kws]
+ENR_KEYWORDS_TARGET = ENR_KEYWORDS_ALL
+
+# --- Signaux projet dans le texte (pour le score de pertinence) ---------------
+PROJECT_SIGNAL_KEYWORDS = [
+    "projet","projets","enquete publique","permis de construire",
+    "autorisation environnementale","implantation","installation","construction",
+    "mise en service","developpement","raccordement","instruction","autorisation",
+    "hectares","ha "," mw"," mwc","exploitation",
+]
+
+# --- Statuts proceduraux (detectes par mots-cles dans le texte) ---------------
+_STATUT_PATTERNS = [
+    ("enquete_publique", ["enquête publique", "enquete publique",
+                          "commissaire enquêteur", "commissaire-enquêteur"]),
+    ("autorise",         ["arrêté préfectoral", "autorisation accordée",
+                          "autorisé", "permis de construire", "avis favorable"]),
+    ("refuse",           ["refusé", "rejeté", "avis défavorable"]),
+    ("instruction",      ["en cours d'instruction", "dossier déposé",
+                          "recevabilité", "dossier de demande"]),
+    ("en_service",       ["mise en service", "en service", "raccordé"]),
+]
+
+# --- Expressions regulieres ---------------------------------------------------
+_RE_POWER     = re.compile(r"(\d{1,4}(?:[\.,]\d{1,3})?)\s*(mwc?\b|megawatts?\b|m\.w\.c?\.?)", re.I)
+_RE_AREA      = re.compile(r"(\d{1,4}(?:[\.,]\d{1,3})?)\s*(ha\b|hectares?\b)", re.I)
+_RE_DATE_NUM  = re.compile(r"\b(\d{1,2})[\s/\-\.](\d{1,2})[\s/\-\.](\d{4})\b")
+_RE_DATE_TEXT = re.compile(
+    r"\b(\d{1,2})\s+(janvier|fevrier|mars|avril|mai|juin|juillet|"
+    r"aout|septembre|octobre|novembre|decembre)\s+(\d{4})\b", re.I)
+_RE_COMMUNE_TITLE = re.compile(
+    r"(?:communes?\s+de\s+|sur\s+(?:la\s+)?commune\s+de\s+"
+    r"|territoire\s+de\s+)"
+    r"(\w[\w\-]*(?:\s+\w[\w\-]*)*)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# ==============================================================================
+#  4. MAPPING GEOGRAPHIQUE
+#     Departement -> region administrative (pour le scoring des sources).
 # ==============================================================================
 
 DEPT_TO_REGION = {
-    # Auvergne-Rhone-Alpes
-    "001": "Auvergne-Rhone-Alpes", "003": "Auvergne-Rhone-Alpes",
-    "007": "Auvergne-Rhone-Alpes", "015": "Auvergne-Rhone-Alpes",
-    "026": "Auvergne-Rhone-Alpes", "038": "Auvergne-Rhone-Alpes",
-    "042": "Auvergne-Rhone-Alpes", "043": "Auvergne-Rhone-Alpes",
-    "063": "Auvergne-Rhone-Alpes", "069": "Auvergne-Rhone-Alpes",
-    "073": "Auvergne-Rhone-Alpes", "074": "Auvergne-Rhone-Alpes",
-    # Bourgogne-Franche-Comte
-    "021": "Bourgogne-Franche-Comte", "025": "Bourgogne-Franche-Comte",
-    "039": "Bourgogne-Franche-Comte", "058": "Bourgogne-Franche-Comte",
-    "070": "Bourgogne-Franche-Comte", "071": "Bourgogne-Franche-Comte",
-    "089": "Bourgogne-Franche-Comte", "090": "Bourgogne-Franche-Comte",
-    # Bretagne
-    "022": "Bretagne", "029": "Bretagne", "035": "Bretagne", "056": "Bretagne",
-    # Centre-Val de Loire
-    "018": "Centre-Val de Loire", "028": "Centre-Val de Loire",
-    "036": "Centre-Val de Loire", "037": "Centre-Val de Loire",
-    "041": "Centre-Val de Loire", "045": "Centre-Val de Loire",
-    # Corse
-    "02A": "Corse", "02B": "Corse",
-    # Grand Est
-    "008": "Grand Est", "010": "Grand Est", "051": "Grand Est",
-    "052": "Grand Est", "054": "Grand Est", "055": "Grand Est",
-    "057": "Grand Est", "067": "Grand Est", "068": "Grand Est", "088": "Grand Est",
-    # Hauts-de-France
-    "002": "Hauts-de-France", "059": "Hauts-de-France", "060": "Hauts-de-France",
-    "062": "Hauts-de-France", "080": "Hauts-de-France",
-    # Ile-de-France
-    "075": "Ile-de-France", "077": "Ile-de-France", "078": "Ile-de-France",
-    "091": "Ile-de-France", "092": "Ile-de-France", "093": "Ile-de-France",
-    "094": "Ile-de-France", "095": "Ile-de-France",
-    # Normandie
-    "014": "Normandie", "027": "Normandie", "050": "Normandie",
-    "061": "Normandie", "076": "Normandie",
-    # Nouvelle-Aquitaine
-    "016": "Nouvelle-Aquitaine", "017": "Nouvelle-Aquitaine",
-    "019": "Nouvelle-Aquitaine", "023": "Nouvelle-Aquitaine",
-    "024": "Nouvelle-Aquitaine", "033": "Nouvelle-Aquitaine",
-    "040": "Nouvelle-Aquitaine", "047": "Nouvelle-Aquitaine",
-    "064": "Nouvelle-Aquitaine", "079": "Nouvelle-Aquitaine",
-    "086": "Nouvelle-Aquitaine", "087": "Nouvelle-Aquitaine",
-    # Occitanie
-    "009": "Occitanie", "011": "Occitanie", "012": "Occitanie",
-    "030": "Occitanie", "031": "Occitanie", "032": "Occitanie",
-    "034": "Occitanie", "046": "Occitanie", "048": "Occitanie",
-    "065": "Occitanie", "066": "Occitanie", "081": "Occitanie", "082": "Occitanie",
-    # Pays de la Loire
-    "044": "Pays de la Loire", "049": "Pays de la Loire",
-    "053": "Pays de la Loire", "072": "Pays de la Loire", "085": "Pays de la Loire",
-    # Provence-Alpes-Cote d'Azur
-    "004": "Provence-Alpes-Cote d'Azur", "005": "Provence-Alpes-Cote d'Azur",
-    "006": "Provence-Alpes-Cote d'Azur", "013": "Provence-Alpes-Cote d'Azur",
-    "083": "Provence-Alpes-Cote d'Azur", "084": "Provence-Alpes-Cote d'Azur",
-    # Outre-mer
-    "971": "Guadeloupe", "972": "Martinique", "973": "Guyane",
-    "974": "La Reunion",  "976": "Mayotte",
+    "001":"Auvergne-Rhone-Alpes","003":"Auvergne-Rhone-Alpes","007":"Auvergne-Rhone-Alpes",
+    "015":"Auvergne-Rhone-Alpes","026":"Auvergne-Rhone-Alpes","038":"Auvergne-Rhone-Alpes",
+    "042":"Auvergne-Rhone-Alpes","043":"Auvergne-Rhone-Alpes","063":"Auvergne-Rhone-Alpes",
+    "069":"Auvergne-Rhone-Alpes","073":"Auvergne-Rhone-Alpes","074":"Auvergne-Rhone-Alpes",
+    "021":"Bourgogne-Franche-Comte","025":"Bourgogne-Franche-Comte",
+    "039":"Bourgogne-Franche-Comte","058":"Bourgogne-Franche-Comte",
+    "070":"Bourgogne-Franche-Comte","071":"Bourgogne-Franche-Comte",
+    "089":"Bourgogne-Franche-Comte","090":"Bourgogne-Franche-Comte",
+    "022":"Bretagne","029":"Bretagne","035":"Bretagne","056":"Bretagne",
+    "018":"Centre-Val de Loire","028":"Centre-Val de Loire","036":"Centre-Val de Loire",
+    "037":"Centre-Val de Loire","041":"Centre-Val de Loire","045":"Centre-Val de Loire",
+    "02A":"Corse","02B":"Corse",
+    "008":"Grand Est","010":"Grand Est","051":"Grand Est","052":"Grand Est",
+    "054":"Grand Est","055":"Grand Est","057":"Grand Est","067":"Grand Est",
+    "068":"Grand Est","088":"Grand Est",
+    "002":"Hauts-de-France","059":"Hauts-de-France","060":"Hauts-de-France",
+    "062":"Hauts-de-France","080":"Hauts-de-France",
+    "075":"Ile-de-France","077":"Ile-de-France","078":"Ile-de-France",
+    "091":"Ile-de-France","092":"Ile-de-France","093":"Ile-de-France",
+    "094":"Ile-de-France","095":"Ile-de-France",
+    "014":"Normandie","027":"Normandie","050":"Normandie","061":"Normandie","076":"Normandie",
+    "016":"Nouvelle-Aquitaine","017":"Nouvelle-Aquitaine","019":"Nouvelle-Aquitaine",
+    "023":"Nouvelle-Aquitaine","024":"Nouvelle-Aquitaine","033":"Nouvelle-Aquitaine",
+    "040":"Nouvelle-Aquitaine","047":"Nouvelle-Aquitaine","064":"Nouvelle-Aquitaine",
+    "079":"Nouvelle-Aquitaine","086":"Nouvelle-Aquitaine","087":"Nouvelle-Aquitaine",
+    "009":"Occitanie","011":"Occitanie","012":"Occitanie","030":"Occitanie",
+    "031":"Occitanie","032":"Occitanie","034":"Occitanie","046":"Occitanie",
+    "048":"Occitanie","065":"Occitanie","066":"Occitanie","081":"Occitanie","082":"Occitanie",
+    "044":"Pays de la Loire","049":"Pays de la Loire","053":"Pays de la Loire",
+    "072":"Pays de la Loire","085":"Pays de la Loire",
+    "004":"Provence-Alpes-Cote d'Azur","005":"Provence-Alpes-Cote d'Azur",
+    "006":"Provence-Alpes-Cote d'Azur","013":"Provence-Alpes-Cote d'Azur",
+    "083":"Provence-Alpes-Cote d'Azur","084":"Provence-Alpes-Cote d'Azur",
+    "971":"Guadeloupe","972":"Martinique","973":"Guyane",
+    "974":"La Reunion","976":"Mayotte",
 }
 
 def region_of(dept_code: str) -> Optional[str]:
-    """Retourne le nom de la region pour un code departement, ou None si inconnu."""
     return DEPT_TO_REGION.get(dept_code)
 
 # ==============================================================================
-#  Flag d arret propre (SIGTERM de Docker)
+#  5. HELPERS GENERIQUES
+#     Connexions DB/Redis, gestion des jobs, normalisation texte.
 # ==============================================================================
 
-_shutdown = False
-
-def _on_signal(signum, frame):
-    global _shutdown
-    logger.info("Signal {} recu, arret apres le job en cours".format(signum))
-    _shutdown = True
-
-signal.signal(signal.SIGTERM, _on_signal)
-signal.signal(signal.SIGINT,  _on_signal)
-
-# ==============================================================================
-#  Clients
-# ==============================================================================
+# --- Clients ------------------------------------------------------------------
 
 def get_redis():
     return redis.from_url(REDIS_URL, decode_responses=True)
@@ -225,9 +250,7 @@ def get_db():
         user=DB_USER, password=DB_PASSWORD
     )
 
-# ==============================================================================
-#  Helpers Redis/job
-# ==============================================================================
+# --- Gestion des jobs Redis ---------------------------------------------------
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -240,300 +263,88 @@ def _load_job(r, job_id: str) -> Optional[dict]:
     return json.loads(raw) if raw else None
 
 def _save_job(r, job: dict) -> None:
-    r.set(_job_key(job["job_id"]), json.dumps(job, default=str),
-          ex=JOB_TTL_DAYS * 86400)
+    r.set(_job_key(job["job_id"]), json.dumps(job, default=str), ex=JOB_TTL_DAYS * 86400)
 
 def _update_job(r, job_id: str, **fields) -> Optional[dict]:
-    """Charge un job, met a jour certains champs, resauvegarde."""
     job = _load_job(r, job_id)
     if job is None:
-        logger.warning("Job {} introuvable lors de la mise a jour".format(job_id))
+        logger.warning("Job {} introuvable".format(job_id))
         return None
     job.update(fields)
     job["updated_at"] = _now_iso()
     _save_job(r, job)
     return job
 
+# --- Normalisation texte (utilisee dans tout le pipeline) --------------------
+
+def _normalize(s: str) -> str:
+    if not s:
+        return ""
+    nfd = unicodedata.normalize("NFD", s.lower())
+    return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+
 # ==============================================================================
-#  Consultation du registre de sources
+#  6. PHASES 1-3 : COLLECTE D'URLs
+#     Sources, communes, crawl prefectoral, SearXNG.
+#     Sortie : liste de dicts {url, method, domain, matched_commune, ...}
 # ==============================================================================
+
+# --- 6.1 Sources et labels ENR -----------------------------------------------
 
 def get_candidate_sources(dept_code: str, enr_type: str) -> List[dict]:
-    """
-    Retourne les sources candidates pour (dept, enr_type), classees par
-    final_score decroissant.
-
-    S appuie sur la fonction SQL news.get_best_sources() qui combine :
-      - score empirique (hit_ratio * avg_quality appris via source_feedback)
-      - scores theoriques (reliability, freshness, early_signal, cost)
-      - affinite source<->type ENR
-      - bonus geographique (dept > region > national)
-      - bonus source interne (ex: MRAE_DB)
-
-    Les sources actives et couvrant la zone apparaissent toutes, classees.
-    Une source sans feedback prend sa valeur theorique uniquement : pas d effet
-    'froid' punitif comme avant.
-    """
     region = region_of(dept_code)
-    conn = get_db()
+    conn   = get_db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
                 SELECT source_id, domain, name, source_type, signal_type,
-                       is_internal, discovery_mode, index_urls,
-                       hubs_discovered_at, niveau,
-                       final_score::float AS final_score
+                       discovery_mode, index_urls,
+                       hubs_discovered_at, niveau, final_score::float AS final_score
                 FROM news.get_best_sources(%(enr_type)s, %(region)s, %(dept)s, %(limit)s)
                 """,
-                {"enr_type": enr_type, "region": region,
-                 "dept": dept_code, "limit": 20}
+                {"enr_type": enr_type, "region": region, "dept": dept_code, "limit": 25}
             )
             return [dict(row) for row in cur.fetchall()]
     finally:
         conn.close()
 
 def get_enr_label(enr_type: str) -> str:
-    """Retourne le label humain du type ENR (ex: 'Photovoltaique' pour 'photovoltaique').
-    Utilise pour construire des requetes web plus pertinentes, notamment pour
-    'poste' qui devient 'Poste electrique'.
-    """
-    conn = get_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT label FROM news.enr_types WHERE code = %s",
-                (enr_type,)
-            )
-            row = cur.fetchone()
-            return row[0] if row else enr_type
-    finally:
-        conn.close()
+    return ENR_LABELS.get(enr_type, enr_type)
 
-# ==============================================================================
-#  Recherche web via SearXNG
-# ==============================================================================
+# --- 6.2 Communes cibles (rayon geographique) --------------------------------
 
-# Verrou global pour serialiser TOUS les hits SearXNG, peu importe le caller.
-# Combine avec SEARXNG_QUERY_DELAY_SEC, cela garantit que les moteurs sous-jacents
-# (DDG, Bing, Wikipedia, ...) ne recoivent pas de rafale qui declencherait un ban.
-_SEARXNG_LOCK         = threading.Lock()
-_SEARXNG_LAST_HIT_AT  = [0.0]   # liste pour mutabilite dans la closure
-
-def _searxng_cache_lookup(query: str) -> Optional[List[dict]]:
-    """Renvoie les resultats cache si la query a ete tiree il y a moins de
-    SEARXNG_CACHE_TTL_HOURS, sinon None.
-    """
-    try:
-        conn = get_db()
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT results, fetched_at
-                FROM news.searxng_cache
-                WHERE query = %s
-                  AND fetched_at > NOW() - %s::interval
-                """,
-                (query, "{} hours".format(SEARXNG_CACHE_TTL_HOURS)),
-            )
-            row = cur.fetchone()
-        conn.close()
-    except Exception as e:
-        logger.warning("SearXNG cache lookup KO: {}".format(e))
-        return None
-    if not row:
-        return None
-    return row["results"]
-
-def _searxng_cache_store(query: str, results: List[dict]) -> None:
-    """Persiste les resultats SearXNG dans la table cache (UPSERT)."""
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO news.searxng_cache (query, results, n_results, fetched_at)
-                VALUES (%s, %s::jsonb, %s, NOW())
-                ON CONFLICT (query) DO UPDATE SET
-                    results    = EXCLUDED.results,
-                    n_results  = EXCLUDED.n_results,
-                    fetched_at = NOW()
-                """,
-                (query, json.dumps(results), len(results)),
-            )
-            conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.warning("SearXNG cache store KO: {}".format(e))
-
-def searxng_search(query: str, max_results: int = SEARXNG_MAX_RESULTS) -> List[dict]:
-    """Interroge SearXNG (avec cache 24h + throttling) et retourne une liste de
-    {url, title, snippet}. Applique la blacklist de domaines.
-
-    Strategie :
-      1. Lookup en cache : si query identique tiree il y a < SEARXNG_CACHE_TTL_HOURS,
-         retourne le cache (pas de hit reseau).
-      2. Sinon : prend le verrou global, attend SEARXNG_QUERY_DELAY_SEC depuis le
-         dernier hit, fait la requete, met en cache, libere le verrou.
-
-    Le verrou + delai garantit qu on ne fait JAMAIS plus de 1 req SearXNG /
-    SEARXNG_QUERY_DELAY_SEC, peu importe la concurrence du worker.
-    Tolerant : en cas d erreur reseau, log + retourne une liste vide.
-    """
-    # 1) Cache hit ?
-    cached = _searxng_cache_lookup(query)
-    if cached is not None:
-        # On rejoue le filtrage blacklist sur les resultats (la blacklist a pu
-        # changer depuis la mise en cache).
-        blacklist = _get_blacklist()
-        return [r for r in cached
-                if r.get("url") and not _is_blacklisted(r["url"], blacklist)
-               ][:max_results]
-
-    # 2) Cache miss -- on serialise et on throttle
-    with _SEARXNG_LOCK:
-        elapsed = time.time() - _SEARXNG_LAST_HIT_AT[0]
-        if elapsed < SEARXNG_QUERY_DELAY_SEC:
-            time.sleep(SEARXNG_QUERY_DELAY_SEC - elapsed)
-        try:
-            resp = httpx.get(
-                "{}/search".format(SEARXNG_URL),
-                params={"q": query, "format": "json", "language": "fr"},
-                timeout=SEARXNG_TIMEOUT_SEC,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logger.warning("SearXNG echec sur '{}': {}".format(query, e))
-            _SEARXNG_LAST_HIT_AT[0] = time.time()
-            return []
-        _SEARXNG_LAST_HIT_AT[0] = time.time()
-
-    # 3) Stocke en cache la liste BRUTE (avant blacklist).
-    # La blacklist peut evoluer ; on cache le brut, on filtre a la lecture.
-    raw_results = []
-    for r in data.get("results", []):
-        url = r.get("url", "")
-        if not url:
-            continue
-        raw_results.append({
-            "url":     url,
-            "title":   r.get("title", ""),
-            "snippet": r.get("content", ""),
-        })
-    _searxng_cache_store(query, raw_results)
-
-    # 4) Applique la blacklist au retour
-    blacklist = _get_blacklist()
-    return [r for r in raw_results
-            if not _is_blacklisted(r["url"], blacklist)
-           ][:max_results]
-
-# --- Blacklist : cache en memoire, rafraichi avec un TTL court ---------------
-_BLACKLIST_CACHE  = {"data": None, "loaded_at": 0.0}
-_BLACKLIST_TTL    = 60.0   # rechargement toutes les 60s maximum
-
-def _get_blacklist() -> set:
-    """Retourne le set des patterns de domaines blacklistes.
-    Cache en memoire process avec TTL court (60s) pour permettre une edition
-    a chaud en base sans redemarrer l agent.
-    """
-    now = time.time()
-    if (_BLACKLIST_CACHE["data"] is not None
-            and now - _BLACKLIST_CACHE["loaded_at"] < _BLACKLIST_TTL):
-        return _BLACKLIST_CACHE["data"]
-
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT domain_pattern FROM news.domain_blacklist;")
-            patterns = {row[0].lower() for row in cur.fetchall()}
-        conn.close()
-    except Exception as e:
-        logger.warning("Blacklist : echec de lecture, fallback vide ({})".format(e))
-        patterns = set()
-
-    _BLACKLIST_CACHE["data"]      = patterns
-    _BLACKLIST_CACHE["loaded_at"] = now
-    return patterns
-
-def _is_blacklisted(url: str, blacklist: set) -> bool:
-    """Renvoie True si l URL appartient a un domaine blackliste.
-    Matching : le pattern 'xnxx.com' matche 'forum.xnxx.com' et 'www.xnxx.com'
-    (suffix-match sur le netloc avec separateur de point).
-    """
-    if not blacklist:
-        return False
-    try:
-        from urllib.parse import urlparse
-        netloc = urlparse(url).netloc.lower()
-    except Exception:
-        return False
-    # Match suffix sur separateur de point : 'xnxx.com' matche 'forum.xnxx.com'
-    # mais pas 'fauxxnxx.com'
-    for pattern in blacklist:
-        if netloc == pattern or netloc.endswith("." + pattern):
-            return True
-    return False
-
-def get_target_communes(
-    commune:    str,
-    dept_code:  str,
-    radius_km:  int,
-) -> List[dict]:
-    """
-    Retourne toutes les communes dans le rayon autour de la commune d origine.
-    La commune d origine est garantie en tete (tri SQL : is_origin DESC,
-    distance_m ASC).
-
-    La liste n est pas tronquee ici : c est process_job qui choisit ce qu il
-    en fait. Typiquement la source interne MRAE utilise la liste complete
-    (requete SQL gratuite) alors que les recherches SearXNG n en gardent
-    que les N plus proches (pour limiter la charge moteurs).
-    """
+def get_target_communes(commune: str, dept_code: str, radius_km: int) -> List[dict]:
     conn = get_db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
-                """
-                SELECT insee_com, nom, population, distance_m, is_origin
-                FROM news.get_communes_in_radius(%s, %s, %s)
-                """,
+                "SELECT insee_com, nom, population, distance_m, is_origin "
+                "FROM news.get_communes_in_radius(%s, %s, %s)",
                 (commune, dept_code, radius_km),
             )
             return [dict(row) for row in cur.fetchall()]
     finally:
         conn.close()
 
-def get_internal_avis(communes: List[dict], enr_type: str) -> List[dict]:
-    """
-    Retourne les avis MRAE existants dans mrae.avis qui matchent (au moins
-    une des) communes cibles et le type d'ENR recherche.
+# --- 6.3 Phase 1 : avis MRAE internes ----------------------------------------
 
-    Matching combine : sur a.communes (noms) OU sur a.geom_point dans le contour
-    d'une commune cible. Voir news.get_internal_avis() pour le detail SQL.
-    """
+def get_internal_avis(communes: List[dict], enr_type: str) -> List[dict]:
+    """Phase 1 : avis MRAE directs via SQL (source interne, discovery_mode='internal')."""
     insee_codes = [c["insee_com"] for c in communes if c.get("insee_com")]
     if not insee_codes:
         return []
-
     conn = get_db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT r_avis_id         AS avis_id,
-                       r_reference_cle   AS reference_cle,
-                       r_nom_projet      AS nom_projet,
-                       r_date_avis       AS date_avis,
-                       r_avis_type       AS avis_type,
-                       r_maitre_ouvrage  AS maitre_ouvrage,
-                       r_puissance_mw    AS puissance_mw,
-                       r_superficie_ha   AS superficie_ha,
-                       r_location        AS location,
-                       r_poste_connexion AS poste_connexion,
-                       r_resume          AS resume,
-                       r_pdf_path        AS pdf_path,
+                SELECT r_avis_id AS avis_id, r_reference_cle AS reference_cle,
+                       r_nom_projet AS nom_projet, r_date_avis AS date_avis,
+                       r_avis_type AS avis_type, r_maitre_ouvrage AS maitre_ouvrage,
+                       r_puissance_mw AS puissance_mw, r_superficie_ha AS superficie_ha,
+                       r_location AS location, r_poste_connexion AS poste_connexion,
+                       r_resume AS resume, r_pdf_path AS pdf_path,
                        r_matched_commune AS matched_commune
                 FROM news.get_internal_avis(%s::text[], %s)
                 """,
@@ -543,632 +354,355 @@ def get_internal_avis(communes: List[dict], enr_type: str) -> List[dict]:
     finally:
         conn.close()
 
-def _enr_keywords_for_type(enr_type: str, enr_label: str) -> List[str]:
-    """Retourne la liste de mots-cles ENR a chercher dans les titres et URLs
-    pour le type donne. Combine ENR_KEYWORDS (defini plus bas, partage avec
-    4b-1) et le label humain.
-    """
-    # ENR_KEYWORDS est defini plus bas dans le fichier (section 4b-1) mais
-    # accessible au runtime via le module global.
-    base = ENR_KEYWORDS.get(enr_type, []) if "ENR_KEYWORDS" in globals() else []
-    if enr_label:
-        base = list(base) + [enr_label]
-    return base
+# --- 6.4 Phase 3 : moteur SearXNG (cache + recherche) ------------------------
 
-def _normalize_text(s: str) -> str:
-    """Normalisation basique pour matching de texte (commune, mots-cles).
-    Lower + suppression des accents.
-    """
-    if not s:
-        return ""
-    import unicodedata
-    nfd = unicodedata.normalize("NFD", s.lower())
-    return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+_SEARXNG_LOCK        = threading.Lock()
+_SEARXNG_LAST_HIT_AT = [0.0]
 
-# Cache des pages d index (TTL 4h) : evite de re-fetcher la meme page
-# d index plusieurs fois dans la meme journee. Cle = index_url.
-_INDEX_CACHE = {}        # url -> (timestamp, list_of_hits)
+def _searxng_cache_lookup(query: str) -> Optional[List[dict]]:
+    try:
+        conn = get_db()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT results FROM news.searxng_cache "
+                "WHERE query=%s AND fetched_at > NOW() - %s::interval",
+                (query, "{} hours".format(SEARXNG_CACHE_TTL_HOURS)),
+            )
+            row = cur.fetchone()
+        conn.close()
+        return row["results"] if row else None
+    except Exception as e:
+        logger.warning("SearXNG cache lookup KO: {}".format(e))
+        return None
+
+def _searxng_cache_store(query: str, results: List[dict]) -> None:
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO news.searxng_cache(query,results,n_results,fetched_at) "
+                "VALUES(%s,%s::jsonb,%s,NOW()) "
+                "ON CONFLICT(query) DO UPDATE SET results=EXCLUDED.results, "
+                "n_results=EXCLUDED.n_results, fetched_at=NOW()",
+                (query, json.dumps(results), len(results)),
+            )
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning("SearXNG cache store KO: {}".format(e))
+
+def searxng_search(query: str, max_results: int = SEARXNG_MAX_RESULTS) -> List[dict]:
+    cached = _searxng_cache_lookup(query)
+    if cached is not None:
+        return [r for r in cached if r.get("url")][:max_results]
+
+    with _SEARXNG_LOCK:
+        elapsed = time.time() - _SEARXNG_LAST_HIT_AT[0]
+        if elapsed < SEARXNG_QUERY_DELAY_SEC:
+            time.sleep(SEARXNG_QUERY_DELAY_SEC - elapsed)
+        try:
+            resp = httpx.get("{}/search".format(SEARXNG_URL),
+                             params={"q": query, "format": "json", "language": "fr"},
+                             timeout=SEARXNG_TIMEOUT_SEC)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning("SearXNG echec '{}': {}".format(query, e))
+            _SEARXNG_LAST_HIT_AT[0] = time.time()
+            return []
+        _SEARXNG_LAST_HIT_AT[0] = time.time()
+
+    raw = [{"url": r.get("url",""), "title": r.get("title",""), "snippet": r.get("content","")}
+           for r in data.get("results", []) if r.get("url")]
+    _searxng_cache_store(query, raw)
+    return raw[:max_results]
+
+# --- 6.5 Phase 2 : crawl index DSFR des hubs prefectoraux --------------------
+
+_INDEX_CACHE         = {}
 _INDEX_CACHE_TTL_SEC = 4 * 3600
-
-# Limite garde-fou pour eviter une boucle infinie en cas de site mal pagine.
-_CRAWL_MAX_PAGES        = 10
-_CRAWL_PAGE_STEP        = 10    # SPIP utilise (offset)/N avec N multiple de 10
+_CRAWL_MAX_PAGES     = 10
+_CRAWL_PAGE_STEP     = 10
 
 def _fetch_one_index_page(page_url: str, dsfr_only: bool = False) -> tuple:
-    """Fetch UNE page d index et extrait les liens utiles.
-    Renvoie (hits_list, soup_or_none, used_dsfr).
-
-    `used_dsfr` indique si l etage DSFR a produit les hits (utile pour que
-    l appelant force le mode DSFR sur les pages suivantes).
-
-    `dsfr_only=True` desactive le fallback generique. A utiliser sur les
-    pages 2+ d une pagination quand on sait que la page 1 etait DSFR :
-    une page 'au-dela de la fin' n a pas de cards DSFR mais a toujours
-    le menu, et le fallback generique ramenerait alors le menu. Avec
-    dsfr_only=True, on retourne juste une liste vide -> la pagination
-    s arrete proprement.
-
-    Strategie de selection a 2 etages :
-
-    Etage 1 -- DSFR (Design System Francais) :
-      Les sites de l administration utilisent depuis 2022 le DSFR avec des
-      composants standardises. Les listings d articles utilisent
-      typiquement des cards avec la classe `fr-card__link` qui pointe
-      vers le contenu reel. C est notre cible prioritaire.
-
-    Etage 2 -- fallback generique :
-      Pour les sites non-DSFR (vieux SPIP, plateformes privees), on tombe
-      sur la logique "tous les <a href> du domaine, longs, hors stoplist".
-      Skip si dsfr_only=True.
-
-    Cette fonction ne fait PAS de cache : c est l appelant qui agrege
-    les pages et met l URL d index racine en cache.
-    """
     try:
-        resp = httpx.get(
-            page_url,
-            timeout=15.0,
-            headers={"User-Agent": _UA_CHROME},
-            follow_redirects=True,
-        )
+        resp = httpx.get(page_url, timeout=15.0, headers={"User-Agent": _UA_CHROME},
+                         follow_redirects=True)
         resp.raise_for_status()
-        html = resp.text
     except Exception as e:
         logger.warning("Crawl index KO {}: {}".format(page_url, e))
         return ([], None, False)
 
     from bs4 import BeautifulSoup
-    from urllib.parse import urljoin, urlparse
+    from urllib.parse import urljoin
     try:
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(resp.text, "lxml")
     except Exception:
         return ([], None, False)
 
     base_netloc = urlparse(page_url).netloc.lower()
-
-    # --- Etage 1 : DSFR cards prioritaires --------------------------------
-    dsfr_links = soup.select("a.fr-card__link[href]")
-
     hits = []
     seen = set()
 
-    if dsfr_links:
-        for a in dsfr_links:
+    # Etage 1 : DSFR fr-card__link
+    dsfr = soup.select("a.fr-card__link[href]")
+    if dsfr:
+        for a in dsfr:
             href = (a.get("href") or "").strip()
-            if not href or href.startswith("#") or href.startswith("javascript:"):
+            if not href or href.startswith(("#", "javascript:")):
                 continue
-            full_url = urljoin(page_url, href)
+            full = urljoin(page_url, href)
             try:
-                netloc = urlparse(full_url).netloc.lower()
+                nl = urlparse(full).netloc.lower()
             except Exception:
                 continue
-            if not (netloc == base_netloc
-                    or netloc.endswith("." + base_netloc.lstrip("www."))):
+            if not (nl == base_netloc or nl.endswith("." + base_netloc.lstrip("www."))):
                 continue
             text = a.get_text(strip=True)
-            if not text or len(text) < 10:
-                continue
-            if full_url in seen:
-                continue
-            seen.add(full_url)
-            hits.append({
-                "url":     full_url,
-                "title":   text[:300],
-                "snippet": "",
-            })
+            if text and len(text) >= 10 and full not in seen:
+                card    = a.find_parent(class_=lambda c: c and "fr-card" in c)
+                det_el  = card.select_one(".fr-card__detail") if card else None
+                pub_date = det_el.get_text(strip=True) if det_el else ""
+
+                seen.add(full)
+                hits.append({"url": full, "title": text[:300], "snippet": "", "pub_date": pub_date})
         if hits:
             return (hits, soup, True)
 
-    # --- Etage 2 : fallback generique pour les sites non-DSFR -------------
-    # Skip explicitement si dsfr_only=True (cas d une page paginee au-dela
-    # de la fin reelle : les cards DSFR ont disparu mais le menu est encore
-    # la, et on ne veut pas le ramener comme s il s agissait d articles).
     if dsfr_only:
         return ([], soup, False)
 
-    stop_anchors = {
-        "accueil", "contact", "mentions legales", "plan du site",
-        "rss", "facebook", "twitter", "linkedin", "youtube",
-        "imprimer", "partager", "telecharger", "haut de page",
-        "demarches", "actualites", "agenda", "newsletter",
-        "se connecter", "deconnexion", "inscription", "abonnement",
-        "outils d accessibilite", "outils accessibilite",
-        "version mobile", "english", "search", "recherche",
-        "tout le site", "voir tout", "voir plus",
-        "publications", "annonces", "etat civil",
-    }
-
+    # Etage 2 : fallback generique
+    stop = {"accueil","contact","mentions legales","plan du site","rss","facebook",
+            "twitter","linkedin","youtube","imprimer","partager","telecharger",
+            "haut de page","demarches","actualites","agenda","newsletter",
+            "se connecter","deconnexion","inscription","abonnement",
+            "outils d accessibilite","version mobile","english","search",
+            "recherche","tout le site","voir tout","voir plus","publications",
+            "annonces","etat civil"}
     for a in soup.select("a[href]"):
         href = (a.get("href") or "").strip()
-        if not href or href.startswith("#") or href.startswith("javascript:") \
-           or href.startswith("mailto:") or href.startswith("tel:"):
+        if not href or href.startswith(("#","javascript:","mailto:","tel:")):
             continue
-        full_url = urljoin(page_url, href)
+        full = urljoin(page_url, href)
         try:
-            netloc = urlparse(full_url).netloc.lower()
+            nl = urlparse(full).netloc.lower()
         except Exception:
             continue
-        if not (netloc == base_netloc
-                or netloc.endswith("." + base_netloc.lstrip("www."))):
+        if not (nl == base_netloc or nl.endswith("." + base_netloc.lstrip("www."))):
             continue
         text = a.get_text(strip=True)
         if not text or len(text) < 10:
             continue
-        text_norm = _normalize_text(text)
-        if text_norm in stop_anchors:
+        tn = _normalize(text)
+        if tn in stop or tn.isdigit():
             continue
-        if text_norm.isdigit() or text_norm in {"page suivante", "page precedente",
-                                                  "suivant", "precedent",
-                                                  "premiere page", "derniere page"}:
+        if tn in {"page suivante","page precedente","suivant","precedent",
+                  "premiere page","derniere page"}:
             continue
-        if full_url in seen:
-            continue
-        seen.add(full_url)
-        hits.append({
-            "url":     full_url,
-            "title":   text[:300],
-            "snippet": "",
-        })
-
+        if full not in seen:
+            seen.add(full)
+            hits.append({"url": full, "title": text[:300], "snippet": ""})
     return (hits, soup, False)
 
 def _crawl_index_page(index_url: str) -> List[dict]:
-    """Fetch une page d index ET ses pages paginees (pattern SPIP `(offset)/N`).
-    Renvoie tous les liens utiles aggreges et dedupliques.
-
-    Strategie pagination :
-      1. Fetch page 1 (URL telle que fournie)
-      2. Si la page contient un lien `<a href*='(offset)/'>`, on suit la
-         pagination en boucle : (offset)/10, (offset)/20, ... jusqu a
-         _CRAWL_MAX_PAGES ou jusqu a une page sans nouveaux liens.
-      3. Cache memoire 4h sur l URL racine (toutes pages cumulees).
-
-    Le pattern (offset)/N est la convention SPIP, utilisee par la quasi
-    totalite des sites prefecture (CMS unifie de l Etat).
-    """
-    # Lookup cache memoire (toutes pages cumulees)
     now = time.time()
     cached = _INDEX_CACHE.get(index_url)
     if cached and now - cached[0] < _INDEX_CACHE_TTL_SEC:
         return cached[1]
 
-    # Page 1
     hits, soup, used_dsfr = _fetch_one_index_page(index_url)
-    all_hits = list(hits)
+    all_hits  = list(hits)
     seen_urls = {h["url"] for h in all_hits}
 
-    # Detection de la pagination : on cherche un lien avec (offset)/ dans le href.
-    # Si oui, on enchaine page 2, 3, ... avec offsets multiples de 10.
-    has_pagination = False
-    if soup is not None:
-        for a in soup.select("a[href]"):
-            if "(offset)/" in (a.get("href") or ""):
-                has_pagination = True
-                break
+    has_pag = soup is not None and any(
+        "(offset)/" in (a.get("href") or "") for a in soup.select("a[href]"))
 
-    if has_pagination:
-        # Construit l URL paginee a partir de l URL racine. On ajoute
-        # /(offset)/N en suffixe (le slash de fin est tolere par SPIP).
-        # Si la page 1 etait DSFR, on force dsfr_only sur les suivantes
-        # pour eviter que le menu generique ne pollue les pages 'au-dela
-        # de la fin'.
+    if has_pag:
         base = index_url.rstrip("/")
-        for page_num in range(1, _CRAWL_MAX_PAGES):
-            offset = page_num * _CRAWL_PAGE_STEP
-            page_url = "{}/(offset)/{}".format(base, offset)
-            page_hits, _, _ = _fetch_one_index_page(page_url, dsfr_only=used_dsfr)
-            # Filtre les hits deja vus en page precedente
-            new_hits = [h for h in page_hits if h["url"] not in seen_urls]
-            if not new_hits:
-                # Plus rien de nouveau -> on arrete
+        for n in range(1, _CRAWL_MAX_PAGES):
+            ph, _, _ = _fetch_one_index_page(
+                "{}/(offset)/{}".format(base, n * _CRAWL_PAGE_STEP),
+                dsfr_only=used_dsfr)
+            new = [h for h in ph if h["url"] not in seen_urls]
+            if not new:
                 break
-            all_hits.extend(new_hits)
-            seen_urls.update(h["url"] for h in new_hits)
+            all_hits.extend(new)
+            seen_urls.update(h["url"] for h in new)
 
     _INDEX_CACHE[index_url] = (now, all_hits)
     return all_hits
 
-# ==============================================================================
-#  DECOUVERTE AUTOMATIQUE DES HUBS PREFECTORAUX
-#
-#  Adapte de tools/discover_hubs.py (script offline). On fait UNE decouverte
-#  complete par prefecture quand son TTL est perime ou qu elle n a pas encore
-#  ete decouverte (hubs_discovered_at IS NULL).
-#
-#  Strategie : on interroge le moteur de recherche interne du site prefecture
-#  sur quelques termes ENR, on score les resultats, on remonte au "hub" parent
-#  (un cran au-dessus dans le path), et on filtre les hubs qui contiennent
-#  d autres hubs (pour ne garder que les feuilles).
-#
-#  Cout estime : 30-90s par prefecture (4 termes x quelques pages, avec
-#  delai 3-6s entre requetes pour eviter de griller le site).
-#
-#  Resultat : liste d URLs (les hubs valides) qui sont stockes en base
-#  dans news.sources.index_urls + hubs_discovered_at = NOW().
-# ==============================================================================
-
-HUB_TTL_DAYS               = int(os.getenv("HUB_TTL_DAYS", "30"))
-_HUB_REQ_DELAY_SEC         = (3.0, 6.0)
-_HUB_SEARCH_TERMS          = ["photovoltaique", "photovolta\u00efque",
-                              "eolien", "\u00e9olien"]
-_HUB_TIMEOUT               = 20
-_HUB_MAX_OFFSET            = 200
-_HUB_MIN_RESULT_SCORE      = 10
-_HUB_MIN_HUB_SCORE         = 20
-
-_HUB_ENR_KEYWORDS = [
-    "photovoltaique", "photovolta\u00efque", "solaire",
-    "agrivoltaique", "agrivolta\u00efque",
-    "centrale photovolta\u00efque", "centrale photovoltaique",
-    "parc solaire", "ferme solaire",
-    "eolien", "\u00e9olien",
-    "parc \u00e9olien", "parc eolien",
-]
-_HUB_PROJECT_KEYWORDS = [
-    "projet", "implantation", "construction", "centrale", "parc",
-]
-_HUB_STRONG_PATTERNS = [
-    "projets-photovoltaiques", "photovoltaiques", "photovolta\u00efques",
-    "enquetes-publiques", "installations-classees",
-]
-_HUB_BAD_PATTERNS = [
-    ".pdf", ".jpg", ".png", ".zip",
-    "linkedin.com", "twitter.com", "facebook.com",
-    "/rss", "/feed", "/actualites", "/espace-presse", "mailto:",
-]
-
-# Verrou global pour serialiser les decouvertes : si plusieurs jobs lancent
-# en parallele un refresh sur la meme prefecture, un seul fait le boulot.
-_HUB_DISCOVERY_LOCK = threading.Lock()
-_HUB_DISCOVERY_INPROGRESS = set()  # set of domain strings
-
-def _hub_score_result(text: str) -> int:
-    """Score d un resultat de recherche prefecture (titre + description)."""
-    lower = text.lower()
-    enr_hits     = sum(k in lower for k in _HUB_ENR_KEYWORDS)
-    project_hits = sum(k in lower for k in _HUB_PROJECT_KEYWORDS)
-    score = 0
-    if enr_hits >= 1:
-        score += 10
-    if project_hits >= 1:
-        score += 5
-    if enr_hits >= 1 and project_hits >= 1:
-        score += 10
-    return score
-
-def _hub_is_bad_url(url: str) -> bool:
-    lower = url.lower()
-    return any(p in lower for p in _HUB_BAD_PATTERNS)
-
-def _hub_get_parent(url: str) -> str:
-    """Remonte d un cran dans le path (pour obtenir l URL 'hub' parent)."""
-    from urllib.parse import urlparse
-    p = urlparse(url)
-    segs = p.path.strip("/").split("/")
-    if len(segs) >= 2:
-        segs = segs[:-1]
-    return "{}://{}/{}".format(p.scheme, p.netloc, "/".join(segs))
-
-def _hub_filter_parents(hubs: List[str]) -> List[str]:
-    """Retire les hubs qui sont des prefixes d autres hubs (on garde les
-    feuilles les plus specifiques).
-    """
-    from urllib.parse import urlparse
-    parsed = []
-    for h in hubs:
-        path = urlparse(h).path.strip("/")
-        segs = path.split("/") if path else []
-        parsed.append({"url": h, "segs": segs})
-    to_remove = set()
-    for i, h1 in enumerate(parsed):
-        for j, h2 in enumerate(parsed):
-            if i == j:
-                continue
-            if len(h2["segs"]) > len(h1["segs"]) \
-               and h2["segs"][:len(h1["segs"])] == h1["segs"]:
-                to_remove.add(h1["url"])
-    return [h for h in hubs if h not in to_remove]
-
-def _hub_fetch(url: str) -> Optional[str]:
-    """Fetch lent (avec delai aleatoire) pour la decouverte de hubs.
-    Renvoie le HTML ou None.
-    """
-    import random as _r
-    delay = _r.uniform(*_HUB_REQ_DELAY_SEC)
-    time.sleep(delay)
-    try:
-        resp = httpx.get(
-            url,
-            timeout=_HUB_TIMEOUT,
-            headers={"User-Agent": _UA_CHROME,
-                     "Accept": "text/html",
-                     "Accept-Language": "fr-FR,fr;q=0.9"},
-            follow_redirects=True,
-        )
-        if resp.status_code != 200:
-            return None
-        ctype = resp.headers.get("Content-Type", "")
-        if "text/html" not in ctype:
-            return None
-        return resp.text
-    except Exception as e:
-        logger.debug("HUB fetch KO {}: {}".format(url, e))
-        return None
-
-def _hub_extract_results(html: str, domain: str) -> List[dict]:
-    """Parse une page de resultats de recherche prefecture (DSFR cards)."""
-    from bs4 import BeautifulSoup
-    from urllib.parse import urljoin
-    try:
-        soup = BeautifulSoup(html, "lxml")
-    except Exception:
-        return []
-    results = []
-    for card in soup.select(".fr-card"):
-        title_el = card.select_one(".fr-card__title")
-        if not title_el:
-            continue
-        link_el = title_el.find("a")
-        if not link_el or not link_el.get("href"):
-            continue
-        href = link_el["href"]
-        full_url = urljoin("https://www.{}".format(domain), href).rstrip("/")
-        if _hub_is_bad_url(full_url):
-            continue
-        title = title_el.get_text(" ", strip=True)
-        desc_el = card.select_one(".fr-card__desc")
-        desc = desc_el.get_text(" ", strip=True) if desc_el else ""
-        score = _hub_score_result(title + " " + desc)
-        if score < _HUB_MIN_RESULT_SCORE:
-            continue
-        results.append({"url": full_url, "score": score})
-    return results
-
-def discover_hubs_for_domain(domain: str) -> List[str]:
-    """Decouvre les hubs ENR pour UNE prefecture. Bloque ~30-90s.
-    Retourne la liste des hubs valides (a stocker dans index_urls).
-    """
-    logger.info("[HUB] Decouverte pour {}".format(domain))
-    hub_scores = {}
-    for term in _HUB_SEARCH_TERMS:
-        offset = 0
-        while offset <= _HUB_MAX_OFFSET:
-            if offset == 0:
-                url = "https://www.{}/contenu/recherche?SearchText={}".format(
-                    domain, term)
-            else:
-                url = "https://www.{}/contenu/recherche/(offset)/{}?SearchText={}".format(
-                    domain, offset, term)
-            html = _hub_fetch(url)
-            if not html:
-                break
-            results = _hub_extract_results(html, domain)
-            if not results:
-                break
-            for r in results:
-                hub = _hub_get_parent(r["url"])
-                bonus = 20 if any(p in hub.lower()
-                                  for p in _HUB_STRONG_PATTERNS) else 0
-                hub_scores[hub] = hub_scores.get(hub, 0) + r["score"] + bonus
-            offset += 10
-    valid = [h for h, s in hub_scores.items() if s >= _HUB_MIN_HUB_SCORE]
-    filtered = _hub_filter_parents(valid)
-    logger.info("[HUB] {} : {} hubs valides".format(domain, len(filtered)))
-    return sorted(filtered)
-
-def _hubs_are_stale(source: dict) -> bool:
-    """Vrai si la source n a jamais ete decouverte ou si TTL depasse."""
-    ts = source.get("hubs_discovered_at")
-    if ts is None:
-        return True
-    try:
-        from datetime import datetime, timezone, timedelta
-        if isinstance(ts, str):
-            ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return (datetime.now(timezone.utc) - ts) > timedelta(days=HUB_TTL_DAYS)
-    except Exception:
-        return True
-
-def _store_hubs_for_source(source_id: int, hubs: List[str]) -> None:
-    """Persiste les hubs decouverts en base."""
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE news.sources SET
-                    index_urls         = %s,
-                    hubs_discovered_at = NOW()
-                WHERE id = %s
-                """,
-                (hubs, source_id),
-            )
-            conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.warning("[HUB] store KO source_id={}: {}".format(source_id, e))
-
-def _ensure_hubs_fresh(source: dict) -> None:
-    """Garantit que la source a des index_urls recents.
-    Si stale ou vide -> lance discover_hubs_for_domain et MAJ la source
-    in-memory + en base. Verrouille pour eviter les decouvertes paralleles
-    sur la meme prefecture.
-    """
-    if not _hubs_are_stale(source):
-        return
-    domain = source["domain"]
-    # Verrou : si une autre tache decouvre deja, on attend qu elle finisse
-    # (en pratique on relit le source en base apres). Mais ici on simplifie :
-    # si quelqu un d autre decouvre, on skip et on utilise les anciens hubs
-    # (ou rien). Le prochain job recuperera les fresh.
-    with _HUB_DISCOVERY_LOCK:
-        if domain in _HUB_DISCOVERY_INPROGRESS:
-            logger.info("[HUB] {} : decouverte en cours par autre tache, skip"
-                        .format(domain))
-            return
-        _HUB_DISCOVERY_INPROGRESS.add(domain)
-    try:
-        hubs = discover_hubs_for_domain(domain)
-        if hubs:
-            _store_hubs_for_source(source["source_id"], hubs)
-            source["index_urls"] = hubs   # MAJ in-memory pour ce job
-        else:
-            logger.warning("[HUB] {} : decouverte vide, on garde les anciens"
-                           .format(domain))
-    finally:
-        with _HUB_DISCOVERY_LOCK:
-            _HUB_DISCOVERY_INPROGRESS.discard(domain)
-
-def _crawl_index_task(source: dict, communes: List[dict],
-                      enr_keywords: List[str]) -> List[dict]:
-    """Tache de discovery 'crawl_index' : fetch la (les) page(s) d index de
-    la source, extrait tous les liens, puis filtre cote Python par :
-      - presence du nom d une commune cible dans le titre/URL
-      - presence d au moins un mot-cle ENR
-
-    Une source peut avoir PLUSIEURS index_urls (cas des prefectures, qui
-    publient sur 4-5 pages d index thematiques : Rapport-Enquetes-publiques,
-    AOEP, Participation-du-public, Etudes-prealables-agricoles, etc.).
-    On les fetche toutes, on agrege, on dedoublonne par URL.
-
-    Comme c est un fetch direct (pas SearXNG), pas de quota a craindre.
-    """
+def _crawl_index_task(source: dict, communes: List[dict], enr_keywords: List[str]) -> List[dict]:
+    """Phase 2 : scraping direct des hubs prefectoraux DSFR (discovery_mode='crawl_index')."""
     index_urls = source.get("index_urls") or []
     if not index_urls:
-        logger.warning("Source {} en mode crawl_index sans index_urls".format(
-            source["domain"]))
+        logger.warning("Source {} crawl_index sans index_urls".format(source["domain"]))
         return []
 
-    # Fetch toutes les pages d index, agregation
-    raw_hits = []
+    raw_hits  = []
     seen_urls = set()
     for url in index_urls:
-        page_hits = _crawl_index_page(url)
-        for h in page_hits:
+        for h in _crawl_index_page(url):
             if h["url"] not in seen_urls:
                 seen_urls.add(h["url"])
-                raw_hits.append(h)
+                raw_hits.append({**h, "from_hub": url})
 
     if not raw_hits:
         return []
 
-    # Normalisations pour matching
-    communes_norm = [(c["nom"], _normalize_text(c["nom"])) for c in communes
-                     if c.get("nom") and len(c["nom"]) >= 4]
-    kw_norm = [_normalize_text(k) for k in enr_keywords if k]
-
-    source_base = {
-        "source_id": source["source_id"],
-        "domain":    source["domain"],
-        "niveau":    source["niveau"],
-    }
+    communes_norm     = [(c["nom"], _normalize(c["nom"])) for c in communes
+                         if c.get("nom") and len(c["nom"]) >= 4]
+    communes_norm_set = {norm for _, norm in communes_norm}
+    kw_norm           = [_normalize(k) for k in enr_keywords if k]
+    source_base = {"source_id": source["source_id"], "domain": source["domain"],
+                   "niveau": source["niveau"], "source_type": source.get("source_type")}
     out = []
     for h in raw_hits:
-        title_norm = _normalize_text(h["title"])
-        url_norm   = _normalize_text(h["url"])
-        # Match commune
-        matched_commune = None
-        for nom_orig, nom_norm in communes_norm:
-            if nom_norm in title_norm or nom_norm in url_norm:
-                matched_commune = nom_orig
-                break
-        # Match mot-cle ENR (au moins un)
-        has_kw = any(k in title_norm for k in kw_norm)
-        # On garde si matched_commune OU mot-cle
-        if not matched_commune and not has_kw:
+        tn = _normalize(h["title"])
+        # Tirets -> espaces pour matcher "la-celle" -> "la celle"
+        un = _normalize(h["url"]).replace("-", " ")
+        mc = next((nom for nom, norm in communes_norm if norm in tn or norm in un), None)
+        if not mc and not any(k in tn for k in kw_norm):
             continue
-        out.append({
-            **source_base,
-            "method":          "crawl_index",
-            "url":             h["url"],
-            "title":           h["title"],
-            "snippet":         "",
-            "matched_commune": matched_commune,
-        })
+        # Commune depuis le titre si mc absent, validee dans le rayon
+        commune_titre = _extract_commune_from_title(h["title"])
+        if commune_titre and _normalize(commune_titre) not in communes_norm_set:
+            commune_titre = None
+        commune_final = mc or commune_titre
+        # Rejeter si aucune commune du rayon confirmee
+        if not commune_final:
+            continue
+        out.append({**source_base, "method": "crawl_index",
+                    "url":             h["url"],
+                    "title":           h["title"],
+                    "snippet":         "",
+                    "pub_date":        h.get("pub_date", ""),
+                    "hub_statut":      _statut_from_hub_url(h.get("from_hub", "")),
+                    "matched_commune": commune_final})
     return out
 
+# --- 6.6 Phase 3 : tache SearXNG par source et commune -----------------------
+
 def _searxng_task(source: dict, commune: dict, enr_label: str) -> List[dict]:
-    """Tache unitaire de recherche SearXNG pour un couple (source, commune).
-    Renvoie la liste des URLs trouvees avec les metadonnees d'appariement.
-    Utilise par le ThreadPoolExecutor -- doit etre thread-safe.
-    """
-    source_base = {
-        "source_id": source["source_id"],
-        "domain":    source["domain"],
-        "niveau":    source["niveau"],
-    }
+    """Phase 3 : recherche SearXNG site:<domain> "commune" enr_label."""
+    sb    = {"source_id": source["source_id"], "domain": source["domain"],
+             "niveau": source["niveau"], "source_type": source.get("source_type")}
     query = 'site:{} "{}" {}'.format(source["domain"], commune["nom"], enr_label)
-    hits  = searxng_search(query)
-    return [
-        {**source_base,
-         "method":          "searxng",
-         "url":             h["url"],
-         "title":           h["title"],
-         "snippet":         h["snippet"],
-         "matched_commune": commune["nom"]}
-        for h in hits
-    ]
+    return [{**sb, "method": "searxng", "url": h["url"], "title": h["title"],
+             "snippet": h["snippet"], "matched_commune": commune["nom"]}
+            for h in searxng_search(query)]
 
-def _searxng_free_task(free_source: dict, commune: dict, enr_label: str) -> List[dict]:
-    """Recherche SearXNG libre (sans 'site:') pour une commune donnee.
-    Les URLs remontees sont attribuees a la pseudo-source 'free_search'
-    (domain='*'). Permet de decouvrir des URLs hors du registre declare
-    (sites de mairies, presse locale non listee, etc.).
-    """
-    source_base = {
-        "source_id": free_source["source_id"],
-        "domain":    free_source["domain"],       # '*'
-        "niveau":    free_source["niveau"],
-    }
-    query = '"{}" {} projet'.format(commune["nom"], enr_label)
-    hits  = searxng_search(query)
-    return [
-        {**source_base,
-         "method":          "free_search",
-         "url":             h["url"],
-         "title":           h["title"],
-         "snippet":         h["snippet"],
-         "matched_commune": commune["nom"]}
-        for h in hits
-    ]
+# --- 6.7 Orchestration collecte (Phases 1 + 2 + 3) ---------------------------
+
+def _enr_keywords_for_type(enr_type: str, enr_label: str) -> List[str]:
+    base = list(ENR_KEYWORDS.get(enr_type, []))
+    if enr_label:
+        base.append(enr_label)
+    return base
+
+def collect_urls_for_sources(
+    sources: List[dict], communes_all: List[dict], communes_for_search: List[dict],
+    enr_type: str, enr_label: str,
+) -> List[dict]:
+    collected = []
+
+    # Phase 1 : internal
+    for s in [s for s in sources if s.get("discovery_mode") == "internal"]:
+        avis_list = get_internal_avis(communes_all, enr_type)
+        logger.info("  internal '{}' : {} avis".format(s["domain"], len(avis_list)))
+        for a in avis_list:
+            collected.append({
+                "source_id":s["source_id"],"domain":s["domain"],"niveau":s["niveau"],
+                "source_type":s.get("source_type"),
+                "method":"internal",
+                "url":"internal://{}/{}".format(s["domain"], a["avis_id"]),
+                "title":a["nom_projet"] or "(sans titre)",
+                "snippet":(a["resume"] or "")[:500],
+                "matched_commune":a["matched_commune"],
+                "extra":{
+                    "avis_id":a["avis_id"],"reference_cle":a["reference_cle"],
+                    "date_avis":a["date_avis"].isoformat() if a["date_avis"] else None,
+                    "avis_type":a["avis_type"],"maitre_ouvrage":a["maitre_ouvrage"],
+                    "puissance_mw":float(a["puissance_mw"]) if a["puissance_mw"] is not None else None,
+                    "superficie_ha":float(a["superficie_ha"]) if a["superficie_ha"] is not None else None,
+                    "location":a["location"],"poste_connexion":a["poste_connexion"],
+                    "pdf_path":a["pdf_path"],
+                },
+            })
+
+    # Phase 2 : crawl_index
+    crawl_sources = [s for s in sources if s.get("discovery_mode") == "crawl_index"]
+    if crawl_sources:
+        kws   = _enr_keywords_for_type(enr_type, enr_label)
+        logger.info("  crawl_index : {} sources".format(len(crawl_sources)))
+        start = time.time()
+        for s in crawl_sources:
+            try:
+                if not s.get("index_urls"):
+                    logger.info("    {} : aucun hub, skip".format(s["domain"]))
+                    continue
+                hits = _crawl_index_task(s, communes_all, kws)
+                collected.extend(hits)
+                logger.info("    {} : {} hits".format(s["domain"], len(hits)))
+            except Exception:
+                logger.exception("Echec crawl_index {}".format(s["domain"]))
+        logger.info("  crawl_index : {:.1f}s".format(time.time()-start))
+
+    # Phase 3 : searxng_site
+    # Top SEARXNG_MAX_SOURCES sources par score + SEARXNG_MAX_COMMUNES communes les plus proches
+    ext = [s for s in sources
+           if s.get("discovery_mode") not in ("internal", "crawl_index")]
+    ext = sorted(ext, key=lambda s: s.get("final_score", 0), reverse=True)[:SEARXNG_MAX_SOURCES]
+    communes_searxng = communes_for_search[:SEARXNG_MAX_COMMUNES]
+    tasks = [(s, c) for s in ext for c in communes_searxng]
+    if tasks:
+        logger.info("  SearXNG : {} req ({} sources x {} communes)".format(
+            len(tasks), len(ext), len(communes_searxng)))
+        start = time.time()
+        with ThreadPoolExecutor(max_workers=SEARXNG_CONCURRENCY) as pool:
+            futures = {pool.submit(_searxng_task, s, c, enr_label):(s,c) for s,c in tasks}
+            for fut in as_completed(futures):
+                try:
+                    collected.extend(fut.result())
+                except Exception:
+                    s,c = futures[fut]
+                    logger.exception("Echec searxng {}/{}".format(s["domain"],c["nom"]))
+        logger.info("  SearXNG : {:.1f}s".format(time.time()-start))
+
+    # Dedup
+    seen   = set()
+    unique = []
+    for c in collected:
+        if c["url"] not in seen:
+            seen.add(c["url"])
+            unique.append(c)
+    return unique
 
 # ==============================================================================
-#  Fetch d'URLs : extraction de texte avec cache en base
+#  7. PHASE 4a : FETCH CONTENU
+#     Telechargement HTTP des URLs collectees, avec cache TTL 30j.
+#     HTML extrait via trafilatura, PDF via Apache Tika.
 # ==============================================================================
-
-# Semaphores par domaine pour ne pas marteler un meme host en parallele.
-# Lock global protegeant le dict _domain_semaphores pour eviter les races.
-from threading import Lock, Semaphore
-from urllib.parse import urlparse
 
 _domain_semaphores_lock = Lock()
 _domain_semaphores: dict = {}
 
 def _get_domain_semaphore(url: str) -> Semaphore:
-    """Retourne (et cree si besoin) le semaphore associe au domaine d une URL."""
     host = urlparse(url).netloc.lower()
     with _domain_semaphores_lock:
-        sem = _domain_semaphores.get(host)
-        if sem is None:
-            sem = Semaphore(FETCH_PER_DOMAIN_MAX)
-            _domain_semaphores[host] = sem
-    return sem
+        if host not in _domain_semaphores:
+            _domain_semaphores[host] = Semaphore(FETCH_PER_DOMAIN_MAX)
+    return _domain_semaphores[host]
 
 def _url_cache_get(url: str) -> Optional[dict]:
-    """Retourne l entree cache si presente et non perimee (TTL), sinon None."""
     conn = get_db()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
-                """
-                SELECT url, http_status, content_type, fetch_method,
-                       text, text_length, fetch_duration, error, fetched_at
-                FROM news.url_cache
-                WHERE url = %s
-                  AND fetched_at > NOW() - (%s || ' days')::interval
-                """,
+                "SELECT url,http_status,content_type,fetch_method,text,text_length,"
+                "fetch_duration,error,fetched_at FROM news.url_cache "
+                "WHERE url=%s AND fetched_at > NOW() - (%s || ' days')::interval",
                 (url, URL_CACHE_TTL_DAYS),
             )
             row = cur.fetchone()
@@ -1177,164 +711,90 @@ def _url_cache_get(url: str) -> Optional[dict]:
         conn.close()
 
 def _url_cache_put(entry: dict) -> None:
-    """UPSERT d une entree dans le cache (par url, mise a jour de fetched_at)."""
     conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO news.url_cache
-                    (url, http_status, content_type, fetch_method,
-                     text, text_length, fetch_duration, error, fetched_at)
-                VALUES (%(url)s, %(http_status)s, %(content_type)s, %(fetch_method)s,
-                        %(text)s, %(text_length)s, %(fetch_duration)s, %(error)s, NOW())
-                ON CONFLICT (url) DO UPDATE SET
-                    http_status    = EXCLUDED.http_status,
-                    content_type   = EXCLUDED.content_type,
-                    fetch_method   = EXCLUDED.fetch_method,
-                    text           = EXCLUDED.text,
-                    text_length    = EXCLUDED.text_length,
-                    fetch_duration = EXCLUDED.fetch_duration,
-                    error          = EXCLUDED.error,
-                    fetched_at     = EXCLUDED.fetched_at
-                """,
+                "INSERT INTO news.url_cache(url,http_status,content_type,fetch_method,"
+                "text,text_length,fetch_duration,error,fetched_at) "
+                "VALUES(%(url)s,%(http_status)s,%(content_type)s,%(fetch_method)s,"
+                "%(text)s,%(text_length)s,%(fetch_duration)s,%(error)s,NOW()) "
+                "ON CONFLICT(url) DO UPDATE SET "
+                "http_status=EXCLUDED.http_status,content_type=EXCLUDED.content_type,"
+                "fetch_method=EXCLUDED.fetch_method,text=EXCLUDED.text,"
+                "text_length=EXCLUDED.text_length,fetch_duration=EXCLUDED.fetch_duration,"
+                "error=EXCLUDED.error,fetched_at=EXCLUDED.fetched_at",
                 entry,
             )
             conn.commit()
     finally:
         conn.close()
 
-def _extract_html(html: str, url: str) -> str:
-    """Extrait le texte propre d un document HTML.
-
-    Strategie :
-      1. trafilatura (mode standard, pas favor_precision) : recupere le
-         corps de l article sans les menus, footers, commentaires.
-      2. Si trafilatura rend moins de 500 caracteres (paywall partiel,
-         layout non-standard, etc.), on fait un fallback en lisant
-         directement <title>, meta-description, <h1> et le premier <p>.
-         Ca permet d'avoir au moins le chapo et l'accroche, qui
-         contiennent souvent l'essentiel des signaux ENR (commune,
-         type, porteur, puissance).
-
-    Le resultat est tronque a FETCH_TEXT_MAX_CHARS.
-    """
-    import trafilatura
-    main = trafilatura.extract(
-        html,
-        url=url,
-        include_comments=False,
-        include_tables=False,
-        favor_precision=False,   # mode par defaut, moins strict
-    ) or ""
-
-    # Si le corps est trop court, on tente le fallback HTML brut
-    if len(main) < 500:
-        fallback = _extract_html_metadata(html)
-        if fallback and len(fallback) > len(main):
-            main = fallback
-
-    return main[:FETCH_TEXT_MAX_CHARS]
-
 def _extract_html_metadata(html: str) -> str:
-    """Fallback : extrait <title>, meta description, premier <h1> et premier <p>
-    depuis le HTML brut. Utile pour les paywalls partiels et les layouts que
-    trafilatura n aime pas.
-    """
     from bs4 import BeautifulSoup
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         return ""
-
     parts = []
-
     if soup.title and soup.title.string:
         parts.append(soup.title.string.strip())
-
-    # Meta description (description classique + Open Graph)
-    for selector in [
-        {"name": "description"},
-        {"property": "og:description"},
-        {"name": "twitter:description"},
-    ]:
-        meta = soup.find("meta", attrs=selector)
+    for sel in [{"name": "description"}, {"property": "og:description"}]:
+        meta = soup.find("meta", attrs=sel)
         if meta and meta.get("content"):
             parts.append(meta["content"].strip())
-            break  # une seule meta suffit
-
+            break
     h1 = soup.find("h1")
     if h1:
-        h1_text = h1.get_text(strip=True)
-        if h1_text:
-            parts.append(h1_text)
-
-    # Premier paragraphe significatif (> 80 chars) dans <main>, <article> ou body
+        t = h1.get_text(strip=True)
+        if t:
+            parts.append(t)
     container = soup.find("article") or soup.find("main") or soup.body
     if container:
         for p in container.find_all("p"):
-            txt = p.get_text(strip=True)
-            if len(txt) >= 80:
-                parts.append(txt)
+            t = p.get_text(strip=True)
+            if len(t) >= 80:
+                parts.append(t)
                 break
+    return "\n".join(dict.fromkeys(parts))
 
-    return "\n".join(dict.fromkeys(parts))   # dedup en gardant l ordre
+def _extract_html(html: str, url: str) -> str:
+    import trafilatura
+    main = trafilatura.extract(html, url=url, include_comments=False,
+                               include_tables=False, favor_precision=False) or ""
+    if len(main) < 500:
+        fb = _extract_html_metadata(html)
+        if fb and len(fb) > len(main):
+            main = fb
+    return main[:FETCH_TEXT_MAX_CHARS]
 
 def _extract_pdf_via_tika(pdf_bytes: bytes) -> str:
-    """Envoie un PDF a Tika et recupere le texte extrait.
-    Le conteneur mrae_tika est partage via mrae_network.
-    """
-    r = httpx.put(
-        TIKA_URL + "/tika",
-        content=pdf_bytes,
-        headers={"Accept": "text/plain"},
-        timeout=60.0,   # Tika peut prendre du temps sur les gros PDFs
-    )
+    r = httpx.put(TIKA_URL + "/tika", content=pdf_bytes,
+                  headers={"Accept": "text/plain"}, timeout=60.0)
     r.raise_for_status()
     return r.text[:FETCH_TEXT_MAX_CHARS]
 
 def fetch_url(url: str) -> dict:
-    """Fetch d une URL avec cache.
-    Renvoie un dict contenant toujours les champs du cache (url, http_status,
-    content_type, fetch_method, text, text_length, fetch_duration, error).
-    Utilise le semaphore par domaine pour limiter la concurrence par host.
-    """
-    # 1. Cache lookup
     cached = _url_cache_get(url)
     if cached is not None:
         cached["from_cache"] = True
         return cached
 
-    # 2. Fetch reseau (avec limite de concurrence par domaine)
-    sem = _get_domain_semaphore(url)
-    with sem:
-        entry = {
-            "url": url, "http_status": None, "content_type": None,
-            "fetch_method": "error", "text": None, "text_length": 0,
-            "fetch_duration": 0.0, "error": None,
-        }
+    with _get_domain_semaphore(url):
+        entry = {"url": url, "http_status": None, "content_type": None,
+                 "fetch_method": "error", "text": None, "text_length": 0,
+                 "fetch_duration": 0.0, "error": None}
         start = time.time()
         try:
             with httpx.Client(
-                follow_redirects=True,
-                timeout=FETCH_TIMEOUT_SEC,
-                headers={
-                    # UA standard de navigateur pour eviter les blocages anti-bot.
-                    # On ne contourne rien : contenus publics, veille informationnelle.
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                              "application/pdf;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-                },
+                follow_redirects=True, timeout=FETCH_TIMEOUT_SEC,
+                headers={"User-Agent": _UA_CHROME,
+                         "Accept": "text/html,application/pdf;q=0.9,*/*;q=0.8",
+                         "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8"},
             ) as client:
                 resp = client.get(url)
             entry["http_status"]  = resp.status_code
             entry["content_type"] = (resp.headers.get("content-type") or "").split(";")[0].strip()
-
             if resp.status_code >= 400:
                 entry["fetch_method"] = "error"
                 entry["error"] = "HTTP {}".format(resp.status_code)
@@ -1346,11 +806,9 @@ def fetch_url(url: str) -> dict:
                 entry["fetch_method"] = "html"
             else:
                 entry["fetch_method"] = "skipped"
-                entry["error"] = "content-type non supporte: {}".format(entry["content_type"])
-
+                entry["error"] = "content-type: {}".format(entry["content_type"])
             if entry["text"] is not None:
                 entry["text_length"] = len(entry["text"])
-
         except httpx.TimeoutException:
             entry["error"] = "timeout"
         except httpx.RequestError as e:
@@ -1360,398 +818,450 @@ def fetch_url(url: str) -> dict:
         finally:
             entry["fetch_duration"] = time.time() - start
 
-    # 3. Stockage en cache :
-    #   - succes (html/pdf) et skipped  -> caches (TTL plein)
-    #   - HTTP 404 (URL morte)          -> cache (inutile de retenter souvent)
-    #   - autres erreurs recuperables   -> PAS cachees (403 anti-bot, 429
-    #     rate-limit, 5xx, timeouts, reseau...) pour permettre retry au prochain job
-    cacheable = (
-        entry["fetch_method"] in ("html", "pdf", "skipped")
-        or entry["http_status"] == 404
-    )
-    if cacheable:
+    if entry["fetch_method"] in ("html","pdf","skipped") or entry["http_status"] == 404:
         try:
             _url_cache_put(entry)
         except Exception:
-            logger.exception("Echec ecriture url_cache pour {}".format(url))
+            logger.exception("Echec url_cache {}".format(url))
 
     entry["from_cache"] = False
     return entry
 
 def fetch_urls_parallel(urls: List[str]) -> dict:
-    """Fetch en parallele d une liste d URLs.
-    Renvoie un dict { url -> entree de cache } et des statistiques agregees.
-    Les URLs internal:// sont ignorees (pas de contenu a fetcher).
-    """
+    """Phase 4a : fetch HTML/PDF en parallele avec cache TTL 30j."""
     targets = [u for u in urls if not u.startswith("internal://")]
     results: dict = {}
-    stats = {"fetched": 0, "cached": 0, "html": 0, "pdf": 0,
-             "skipped": 0, "errors": 0, "total": len(targets)}
-
+    stats = {"fetched": 0,"cached": 0,"html": 0,"pdf": 0,
+             "skipped": 0,"errors": 0,"total": len(targets)}
     if not targets:
         return {"results": results, "stats": stats}
 
-    logger.info("  Fetch : {} URLs (concurrency={}, per-domain max {})".format(
-        len(targets), FETCH_CONCURRENCY, FETCH_PER_DOMAIN_MAX
-    ))
+    logger.info("  Fetch : {} URLs (concurrency={})".format(len(targets), FETCH_CONCURRENCY))
     start = time.time()
     with ThreadPoolExecutor(max_workers=FETCH_CONCURRENCY) as pool:
         futures = {pool.submit(fetch_url, u): u for u in targets}
         for fut in as_completed(futures):
             u = futures[fut]
             try:
-                entry = fut.result()
-                results[u] = entry
-                if entry.get("from_cache"):
-                    stats["cached"] += 1
-                else:
-                    stats["fetched"] += 1
-                method = entry.get("fetch_method")
-                if method == "html":    stats["html"]    += 1
-                elif method == "pdf":   stats["pdf"]     += 1
-                elif method == "skipped": stats["skipped"] += 1
-                elif method == "error": stats["errors"]  += 1
+                e = fut.result()
+                results[u] = e
+                stats["cached" if e.get("from_cache") else "fetched"] += 1
+                m = e.get("fetch_method")
+                if m == "html":      stats["html"]    += 1
+                elif m == "pdf":     stats["pdf"]     += 1
+                elif m == "skipped": stats["skipped"] += 1
+                elif m == "error":   stats["errors"]  += 1
             except Exception:
                 logger.exception("Echec fetch {}".format(u))
                 stats["errors"] += 1
-    elapsed = time.time() - start
-    logger.info("  Fetch : {} termines en {:.1f}s (cache={}, fetched={}, "
-                "html={}, pdf={}, skipped={}, errors={})".format(
-                    len(targets), elapsed,
-                    stats["cached"], stats["fetched"],
-                    stats["html"], stats["pdf"],
-                    stats["skipped"], stats["errors"]))
+    logger.info("  Fetch : {} en {:.1f}s (cache={},fetched={},html={},pdf={},skip={},err={})".format(
+        len(targets), time.time()-start, stats["cached"], stats["fetched"],
+        stats["html"], stats["pdf"], stats["skipped"], stats["errors"]))
     return {"results": results, "stats": stats}
 
 # ==============================================================================
-#  Etape 4b-1 : pre-extraction regex de candidats projets
+#  8. PHASE 4b : EXTRACTION REGEX
+#     Extraction des champs projet depuis le texte brut :
+#     puissance, surface, porteur, date, statut, commune, resume.
 # ==============================================================================
-import re
-import unicodedata
 
-# Liste de porteurs ENR connus (voir DEVELOPERS.md).
-# Structure : (nom_canonique, [alias_a_detecter]).
-# Detection insensible a la casse et aux accents via normalisation prealable.
-KNOWN_DEVELOPERS = [
-    # --- Grands groupes integres ---
-    ("EDF Renouvelables", ["EDF Renouvelables", "EDF EN", "EDF Energies Nouvelles"]),
-    ("Engie Green",       ["Engie Green", "Engie EPS", "Engie Solar"]),
-    ("TotalEnergies",     ["TotalEnergies Renouvelables", "TotalEnergies", "Total Quadran", "Quadran"]),
-    ("RWE",               ["RWE Renouvelables", "RWE"]),
-    ("Iberdrola",         ["Iberdrola"]),
-    ("Vattenfall",        ["Vattenfall"]),
-    ("Shell Energy",      ["Shell Energy"]),
-    # --- Pure players francais ---
-    ("Neoen",             ["Neoen"]),
-    ("Voltalia",          ["Voltalia"]),
-    ("Boralex",           ["Boralex"]),
-    ("Valorem",           ["Groupe Valorem", "Valorem"]),
-    ("Akuo Energy",       ["Akuo Energy", "Akuo"]),
-    ("Reden Solar",       ["Reden Solar", "Reden"]),
-    ("Urbasolar",         ["Axpo Urbasolar", "Urbasolar"]),
-    ("Tenergie",          ["Tenergie", "Tenergie"]),
-    ("TSE",               ["Technique Solaire", "TSE"]),
-    ("Qair",              ["Groupe Qair", "Qair"]),
-    ("Arkolia Energies",  ["Arkolia"]),
-    ("Luxel",             ["Luxel"]),
-    ("Photosol",          ["Photosol Developpement", "Photosol"]),
-    ("GreenYellow",       ["GreenYellow"]),
-    ("Solveo Energie",    ["Solveo Energie", "Solveo"]),
-    ("UNITe",             ["UNITe", "Unite"]),
-    ("Valeco",            ["Valeco"]),
-    ("Kallista Energy",   ["Kallista"]),
-    ("EnergieTEAM",       ["EnergieTEAM", "Energie Team"]),
-    ("Ciel et Terre",     ["Ciel et Terre"]),
-    # --- Developpeurs francais taille moyenne ---
-    ("Energiter",         ["Energiter", "Eurocape New Energy France", "David Energies"]),
-    ("Vensolair",         ["Vensolair"]),
-    ("Nouvergies",        ["Nouvergies"]),
-    ("IEL",               ["IEL"]),
-    ("EOLFI",             ["EOLFI"]),
-    ("Nass et Wind",      ["Nass & Wind", "Nass et Wind"]),
-    ("Quenea",            ["Quenea", "Quenea Energies Renouvelables"]),
-    ("VSB Energies",      ["VSB energies nouvelles", "VSB Energies", "VSB"]),
-    ("Volkswind",         ["Volkswind"]),
-    ("Sepale",            ["Sepale", "SEPALE"]),
-    ("Renner Energies",   ["Renner Energies", "Renner"]),
-    ("GazelEnergie",      ["GazelEnergie", "Gazel Energie"]),
-    ("ABO Energy",        ["ABO Energy", "ABO Wind"]),
-    ("Octopus Energy",    ["Octopus Energy"]),
-    # --- Developpeurs etrangers actifs en France ---
-    ("wpd France",        ["wpd France", "wpd"]),
-    ("RES",               ["Renewable Energy Systems", "RES"]),
-    ("BayWa r.e.",        ["BayWa r.e.", "BayWa"]),
-    ("Enertrag",          ["Enertrag"]),
-    ("Alterric",          ["Alterric"]),
-    ("Q Energy",          ["Q Energy", "Q-Energy"]),
-    ("ERG",               ["ERG"]),
-    ("NTR",               ["NTR"]),
-    ("Elicio",            ["Elicio"]),
-    # --- Filiales grands groupes historiques ---
-    ("CNR",               ["Compagnie Nationale du Rhone", "CNR"]),
-    ("EDPR",              ["EDP Renewables", "EDPR"]),
-    # --- Fonds et financiers majeurs ---
-    ("Meridiam",          ["Meridiam"]),
-    ("Mirova",            ["Mirova"]),
-    ("Eurazeo",           ["Eurazeo"]),
-    ("Andera Partners",   ["Andera Partners"]),
-    ("Banque des Territoires", ["Banque des Territoires"]),
-    ("Caisse des Depots", ["Caisse des Depots", "CDC"]),
-    ("Bpifrance",         ["Bpifrance", "BPI France"]),
-    ("Predica",           ["Credit Agricole Assurances", "Predica"]),
-    ("AXA IM",            ["AXA Investment Managers", "AXA IM"]),
-    ("Amundi",            ["Amundi Transition Energetique", "Amundi"]),
-    ("Rivage Investissement", ["Rivage Investissement", "Rivage"]),
-    ("Demeter IM",        ["Demeter IM", "Demeter"]),
-    ("Omnes Capital",     ["Omnes Capital", "Omnes"]),
-    ("Swen Capital",      ["Swen Capital Partners", "Swen"]),
-    ("RGreen Invest",     ["RGreen Invest", "RGreen"]),
-    ("Glennmont",         ["Glennmont Partners", "Glennmont"]),
-    ("Infravia",          ["Infravia"]),
-    ("Vauban",            ["Vauban Infrastructure Partners", "Vauban"]),
-    ("La Nef",            ["La Nef"]),
-    # --- Citoyens / cooperatifs ---
-    ("Enercoop",          ["Enercoop"]),
-    ("Energie Partagee",  ["Energie Partagee", "Energie Partagee Investissement", "EPI"]),
-    ("EnRciT",            ["EnRciT"]),
-    ("Centrales Villageoises", ["Centrales Villageoises"]),
-    ("Hespul",            ["Hespul"]),
-]
+# --- 8.1 Developpeurs ENR (charges depuis news.sources au demarrage) ---------
 
-# Mots-cles signalant un type ENR (detection de pertinence).
-# Les cles doivent matcher les codes enr_types de la base.
-ENR_KEYWORDS = {
-    "photovoltaique": ["photovoltaique", "photovoltaiques", "centrale solaire",
-                       "parc solaire", "panneaux solaires", "panneau solaire",
-                       "pv", "mwc"],
-    "agrivoltaique":  ["agrivoltaique", "agrivoltaiques", "agrivoltaisme",
-                       "agri-pv", "agripv"],
-    "eolien":         ["eolien", "eolienne", "eoliennes", "parc eolien",
-                       "turbine", "turbines", "mat", "mats"],
-    "stockage":       ["stockage d'energie", "batterie", "batteries",
-                       "storage", "bess"],
-    "poste":          ["poste source", "poste electrique", "raccordement",
-                       "transformateur"],
-    "biomasse":       ["biomasse", "methanisation", "biogaz", "bois energie",
-                       "cogeneration"],
-    "hydraulique":    ["hydraulique", "hydroelectrique", "barrage", "turbine hydro"],
-    "geothermie":     ["geothermie", "geothermique"],
-    "nucleaire":      ["nucleaire", "epr", "reacteur"],
-    "fossile":        ["gaz naturel", "fioul", "charbon", "turbine a gaz"],
-}
+_DEVELOPER_NAMES: List[tuple] = []   # [(canonical_name, domain_hint), ...]
 
-# Mots-cles "signal de projet" : renforcent la pertinence si presents.
-PROJECT_SIGNAL_KEYWORDS = [
-    "projet", "projets",
-    "enquete publique", "permis de construire", "autorisation environnementale",
-    "implantation", "installation", "construction", "mise en service",
-    "developpement", "developper", "developpe",
-    "raccordement", "instruction", "autorisation",
-    "hectares", "ha ", " mw", " mwc",
-    "exploitation", "exploiter",
-]
+def _load_developer_names() -> None:
+    """Charge les noms de developpeurs depuis news.sources."""
+    global _DEVELOPER_NAMES
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT name, domain FROM news.sources "
+                "WHERE source_type = 'developer' AND is_active = true "
+                "ORDER BY name"
+            )
+            _DEVELOPER_NAMES = [(row[0], row[1].split(".")[0]) for row in cur.fetchall()]
+        conn.close()
+    except Exception as e:
+        logger.warning("Chargement developpeurs KO : {}".format(e))
 
-def _normalize(s: str) -> str:
-    """Normalise une chaine pour matching robuste : lowercase + suppression accents.
-    Garde la ponctuation et les espaces.
-    """
-    if not s:
-        return ""
-    nfd = unicodedata.normalize("NFD", s.lower())
-    return "".join(c for c in nfd if unicodedata.category(c) != "Mn")
+# --- 8.2 Helpers d'extraction (puissance, surface, date) ---------------------
 
-# Regex compiles une seule fois au chargement
-# Puissance : "25 MW", "25.5 MWc", "25,5 megawatts"
-_RE_POWER = re.compile(
-    r"(\d{1,4}(?:[\.,]\d{1,3})?)\s*(mwc?\b|megawatts?\b|m\.w\.c?\.?)",
-    re.IGNORECASE,
-)
-# Superficie : "32 ha", "32,5 hectares"
-_RE_AREA = re.compile(
-    r"(\d{1,4}(?:[\.,]\d{1,3})?)\s*(ha\b|hectares?\b)",
-    re.IGNORECASE,
-)
-# Dates : 15/03/2024, 15-03-2024, 15 mars 2024
-_RE_DATE_NUM  = re.compile(r"\b(\d{1,2})[\s/\-\.](\d{1,2})[\s/\-\.](\d{4})\b")
-_RE_DATE_TEXT = re.compile(
-    r"\b(\d{1,2})\s+(janvier|fevrier|mars|avril|mai|juin|juillet|"
-    r"aout|septembre|octobre|novembre|decembre)\s+(\d{4})\b",
-    re.IGNORECASE,
-)
-
-def _extract_power_mw(text_norm: str) -> Optional[float]:
-    """Extrait la premiere puissance MW/MWc mentionnee, en float."""
-    m = _RE_POWER.search(text_norm)
+def _extract_power_mw(t: str) -> Optional[float]:
+    m = _RE_POWER.search(t)
     if not m:
         return None
-    raw = m.group(1).replace(",", ".")
     try:
-        val = float(raw)
+        v = float(m.group(1).replace(",","."))
+        return v if 0.05 <= v <= 2000 else None
     except ValueError:
         return None
-    # Filtre de sanite : un projet ENR en France est typiquement 0.1 a 1000 MW
-    if 0.05 <= val <= 2000:
-        return val
-    return None
 
-def _extract_area_ha(text_norm: str) -> Optional[float]:
-    """Extrait la premiere superficie en hectares."""
-    m = _RE_AREA.search(text_norm)
+def _extract_area_ha(t: str) -> Optional[float]:
+    m = _RE_AREA.search(t)
     if not m:
         return None
-    raw = m.group(1).replace(",", ".")
     try:
-        val = float(raw)
+        v = float(m.group(1).replace(",","."))
+        return v if 0.1 <= v <= 5000 else None
     except ValueError:
         return None
-    if 0.1 <= val <= 5000:
-        return val
-    return None
 
 def _extract_date(text: str) -> Optional[str]:
-    """Extrait la premiere date au format ISO YYYY-MM-DD, ou None."""
-    _MONTHS = {"janvier":1, "fevrier":2, "mars":3, "avril":4, "mai":5, "juin":6,
-               "juillet":7, "aout":8, "septembre":9, "octobre":10,
-               "novembre":11, "decembre":12}
-    text_norm = _normalize(text)
-    m = _RE_DATE_TEXT.search(text_norm)
+    _M = {"janvier":1,"fevrier":2,"mars":3,"avril":4,"mai":5,"juin":6,
+          "juillet":7,"aout":8,"septembre":9,"octobre":10,"novembre":11,"decembre":12}
+    tn = _normalize(text)
+    m  = _RE_DATE_TEXT.search(tn)
     if m:
-        day   = int(m.group(1))
-        month = _MONTHS.get(m.group(2).lower())
-        year  = int(m.group(3))
-        if month and 2000 <= year <= 2030:
-            return "{:04d}-{:02d}-{:02d}".format(year, month, day)
+        mo = _M.get(m.group(2).lower())
+        y  = int(m.group(3))
+        if mo and 2000 <= y <= 2030:
+            return "{:04d}-{:02d}-{:02d}".format(y, mo, int(m.group(1)))
     m = _RE_DATE_NUM.search(text)
     if m:
-        day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if 1 <= day <= 31 and 1 <= month <= 12 and 2000 <= year <= 2030:
-            return "{:04d}-{:02d}-{:02d}".format(year, month, day)
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= d <= 31 and 1 <= mo <= 12 and 2000 <= y <= 2030:
+            return "{:04d}-{:02d}-{:02d}".format(y, mo, d)
     return None
 
-def _detect_developer(text_norm: str) -> Optional[str]:
-    """Scanne le texte (deja normalise) pour trouver un porteur connu.
-    Retourne le nom canonique du premier matche, ou None.
+# --- 8.3 Helpers de detection (porteur, communes, pertinence) ----------------
+
+def _detect_developer(t: str) -> Optional[str]:
+    """Detecte le porteur ENR depuis le texte normalise.
+    Cherche le nom canonique ET la racine du domaine (ex: 'energiter').
     """
-    for canonical, aliases in KNOWN_DEVELOPERS:
-        for alias in aliases:
-            if _normalize(alias) in text_norm:
-                return canonical
+    for name, domain_hint in _DEVELOPER_NAMES:
+        if _normalize(name) in t or domain_hint in t:
+            return name
     return None
 
 def _detect_communes_in_text(text_norm: str, communes: List[dict]) -> List[str]:
-    """Retourne la liste des noms de communes cibles effectivement mentionnees
-    dans le texte. Utilise pour valider la pertinence geographique.
-    """
-    found = []
-    for c in communes:
-        nom_norm = _normalize(c["nom"])
-        if len(nom_norm) >= 4 and nom_norm in text_norm:
-            found.append(c["nom"])
-    return found
+    return [c["nom"] for c in communes
+            if c.get("nom") and len(c["nom"]) >= 4 and _normalize(c["nom"]) in text_norm]
 
 def _compute_relevance(text_norm: str, communes_found: List[str],
-                       enr_type: str) -> float:
-    """Score de pertinence heuristique entre 0 et 1 :
-       - 0.0 si texte trop court (< 200 caracteres)
-       - 0.0 si aucune commune cible mentionnee
-       - 0.0 si aucun mot-cle ENR du type recherche
-       - sinon : somme de signaux normalisee
-    """
+                       enr_type: str, matched_commune: Optional[str] = None) -> float:
     if len(text_norm) < 200:
         return 0.0
-    if not communes_found:
+    eff = communes_found if communes_found else ([matched_commune] if matched_commune else [])
+    if not eff:
         return 0.0
-
-    enr_kws = ENR_KEYWORDS.get(enr_type, [])
+    enr_kws  = ENR_KEYWORDS.get(enr_type, [])
     enr_hits = sum(1 for k in enr_kws if k in text_norm)
     if enr_hits == 0:
         return 0.0
+    sig_hits = sum(1 for k in PROJECT_SIGNAL_KEYWORDS if k in text_norm)
+    return round(min(1.0, 0.4 + min(0.4, 0.1*sig_hits) + min(0.2, 0.05*(enr_hits-1))), 2)
 
-    signal_hits = sum(1 for k in PROJECT_SIGNAL_KEYWORDS if k in text_norm)
-    # Formule empirique : 0.4 pour le minimum viable (commune + 1 kw ENR),
-    # +0.1 par signal de projet jusqu'a +0.4, +0.1 par kw ENR supplementaire.
-    score = 0.4 + min(0.4, 0.1 * signal_hits) + min(0.2, 0.05 * (enr_hits - 1))
-    return round(min(1.0, score), 2)
+# --- 8.4 Helpers de statut et de titre (specifiques DSFR) --------------------
+
+def _detect_statut(text_norm: str) -> Optional[str]:
+    for statut, patterns in _STATUT_PATTERNS:
+        if any(_normalize(p) in text_norm for p in patterns):
+            return statut
+    return None
+
+def _statut_from_hub_url(hub_url: str) -> Optional[str]:
+    u = hub_url.lower()
+    if any(k in u for k in ("enquetes-publiques", "enquete-publique")):
+        return "enquete_publique"
+    if any(k in u for k in ("installations-classees", "icpe",
+                             "autorisation-environnementale")):
+        return "instruction"
+    if "autorisations" in u:
+        return "autorise"
+    return None
+
+def _extract_commune_from_title(title: str) -> Optional[str]:
+    m = _RE_COMMUNE_TITLE.search(title or "")
+    return m.group(1).strip() if m else None
+
+def _parse_pub_date(s: str) -> Optional[str]:
+    """'Publié le 04/05/2026' -> '2026-05-04'"""
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", s or "")
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= d <= 31 and 1 <= mo <= 12 and 2000 <= y <= 2030:
+            return "{:04d}-{:02d}-{:02d}".format(y, mo, d)
+    return None
+
+def _extract_resume(text: str, enr_type: str, max_chars: int = 350) -> Optional[str]:
+    if not text:
+        return None
+    kws = ENR_KEYWORDS.get(enr_type, [])
+    for sent in re.split(r'(?<=[.!?])\s+', text):
+        sent = sent.strip()
+        if len(sent) < 40:
+            continue
+        if any(k in _normalize(sent) for k in kws):
+            return sent[:max_chars]
+    return text[:max_chars]
+
+def _clean_nom_projet(title: str) -> str:
+    """Normalise le titre d un projet ENR en supprimant le bruit administratif.
+
+    Transformations (dans l ordre) :
+      1. Supprime le suffixe de localisation (a Commune (18), sur la commune de...)
+      2. Extrait le lieu-dit s il est present
+      3. Coupe tout apres le premier tiret si lieu-dit extrait
+      4. Supprime les prefixes verbaux (Construction/Creation/Realisation d une...)
+      5. Gere "X et Y en projet" -> "Projet de X"
+      6. Supprime "Projet de" seul devant le type
+      7. Supprime l article initial (Une, Un)
+      8. Supprime la puissance (d environ 7 MWc)
+      9. Formate : "Type [- Lieu-dit]"
+
+    Note : tous les caracteres speciaux sont specifies litteralement.
+    Pas d echappements \\uXXXX dans des raw strings Python.
+    Extensible pour eolien et agrivoltaique (memes patterns structurels).
+    """
+    if not title:
+        return title
+
+    t = title.strip()
+    lieu_dit = None
+
+    # --- 1. Supprimer le suffixe de localisation (TOUJOURS EN PREMIER) ---
+    # Detection sur le texte NORMALISE (ASCII-only) pour eviter les problemes
+    # d encodage avec les caracteres accentues dans les patterns regex.
+    # _normalize() preserve la longueur → m.start() indexe l original.
+    t_norm = _normalize(t)
+    _LOC = re.compile(
+        r'\s+(?:'
+        r'a\s+[a-z][\w-]+(?:\s+[a-z][\w-]+)*\s*(?:\(\d{2,3}\))?'
+        r"|sur\s+la\s+commune\s+d(?:e\s+|[''`])\s*[a-z][\w\s-]*?(?:\s*\(\d{2,3}\))?"
+        r'|sur\s+les\s+communes\s+de\s+[a-z][\w\s,-]*?(?:\s*\(\d{2,3}\))?'
+        r"|sur\s+le\s+territoire\s+d(?:e\s+|[''`])\s*[a-z][\w\s-]*?(?:\s*\(\d{2,3}\))?"
+        r')\s*$'
+    )
+    m_loc = _LOC.search(t_norm)
+    if m_loc:
+        t = t[:m_loc.start()]
+
+    # --- 2. Extraire le lieu-dit ---
+
+    # 2a. "- Lieu-dit « Les Clairs »" ou "- Lieu-dit Les Clairs" en fin
+    m = re.search(r'\s*[-–—]\s*lieu.?dit\s*[«"]?\s*(.+?)\s*[»"]?\s*$', t, re.IGNORECASE)
+    if m:
+        lieu_dit = m.group(1).strip().strip('«»"')
+        t = t[:m.start()]
+
+    # 2b. "au lieu-dit Chêne des Pendus" en fin (localisation deja supprimee)
+    if not lieu_dit:
+        m = re.search(r'\s+au\s+lieu.?dit\s*[«"]?\s*(.+?)\s*[»"]?\s*$', t, re.IGNORECASE)
+        if m:
+            lieu_dit = m.group(1).strip().strip('«»"')
+            t = t[:m.start()]
+
+    # 2c. "« La Brande des Grands Cours »" ou '"Nom"' en fin
+    if not lieu_dit:
+        m = re.search(r'\s*[«"]\s*(.+?)\s*[»"]\s*$', t)
+        if m:
+            lieu_dit = m.group(1).strip()
+            t = t[:m.start()]
+
+    # --- 3. Couper apres le premier tiret si lieu-dit extrait ---
+    if lieu_dit:
+        t = re.sub(r'\s*[-–—]\s*.+$', '', t)
+
+    # --- 4. Supprimer les prefixes verbaux ---
+    t = re.sub(
+        r"^(?:projet\s+de\s+)?"
+        r"(?:r[ée]alisation|construction|cr[ée]ation|"
+        r"mise\s+en\s+(?:place|service)|implantation|d[ée]veloppement|installation)"
+        r"\s+d['']\s*(?:une?\s+|un\s+)",
+        '', t, flags=re.IGNORECASE)
+    t = re.sub(
+        r"^(?:construction|cr[ée]ation|r[ée]alisation|installation|implantation)"
+        r"\s+d['']\s*(?:une?\s+|un\s+)",
+        '', t, flags=re.IGNORECASE)
+
+    # --- 5. "X et Y en projet" -> "Projet de X" ---
+    if re.search(r'\s+en\s+projet\s*$', t, re.IGNORECASE):
+        t = re.sub(r'\s+en\s+projet\s*$', '', t, flags=re.IGNORECASE)
+        t = re.sub(
+            r"\s+et\s+un[e']?\s+(?!(?:parc|centrale|installation|projet|panneau)).+$",
+            '', t, flags=re.IGNORECASE)
+        t = re.sub(r'^(?:une?\s+|un\s+)', '', t, flags=re.IGNORECASE)
+        t = t.strip()
+        return 'Projet de ' + (t[0].lower() + t[1:] if t else t)
+
+    # --- 6. Supprimer "Projet de" seul devant le type ---
+    t = re.sub(r'^projet\s+de\s+', '', t, flags=re.IGNORECASE)
+
+    # --- 7. Supprimer l article initial ---
+    t = re.sub(r'^(?:une?\s+|un\s+)', '', t, flags=re.IGNORECASE)
+
+    # --- 8. Supprimer la puissance ---
+    t = re.sub(r"\s+d['']\s*environ\s+[\d,.]+\s*MWc?\b", '', t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+de\s+[\d,.]+(?:\s*à\s*[\d,.]+)?\s*MWc?\b", '', t, flags=re.IGNORECASE)
+
+    # --- Nettoyage et capitalisation ---
+    t = t.strip().strip('-–—').strip()
+    if t:
+        t = t[0].upper() + t[1:]
+    if lieu_dit:
+        lieu_dit = lieu_dit[0].upper() + lieu_dit[1:] if lieu_dit else lieu_dit
+        t = (t + ' - ' + lieu_dit) if t else lieu_dit
+
+    return t
+
+
+# --- 8.5 Helpers de qualification (regles de selection robuste) --------------
+
+# Règle 1 : URLs de listing/tag/categorie — jamais un article sur un projet unique.
+_RE_LISTING_URL = re.compile(
+    r'/(?:tag|tags|category|categorie|topic|topics|dossier|'
+    r'auteur|author|archive|archives|search|recherche)/'
+    r'|/page/\d+/?(?:\?|$)'
+    r'|\?(?:s=|q=|search=|tag=)',
+    re.I
+)
+
+def _is_listing_url(url: str) -> bool:
+    """True si l URL est une page de listing (tag, categorie, page/N, ...).
+    Ces pages aggregent plusieurs articles et ne decrivent pas un projet unique.
+    """
+    try:
+        return bool(_RE_LISTING_URL.search(url))
+    except Exception as e:
+        logger.warning("_is_listing_url erreur sur {} : {}".format(url[:80], e))
+        return False
+
+def _commune_from_title(title: str, communes: List[dict]) -> Optional[str]:
+    """Retourne la premiere commune du rayon trouvee dans le titre, ou None.
+    Utilise une frontiere de mot pour eviter les faux positifs :
+    ex. 'Meillant' ne doit pas matcher dans 'Chateaumeillant'.
+    """
+    title_norm = _normalize(title or "")
+    for c in communes:
+        nom = c.get("nom") or ""
+        if len(nom) >= 4:
+            pattern = r'(?<![a-z])' + re.escape(_normalize(nom)) + r'(?![a-z])'
+            if re.search(pattern, title_norm):
+                return nom
+    return None
+
+# Règle 3 : types de sources necessitant la commune dans le titre OU l URL.
+# Les sources officielles (crawl_index) valident deja la commune en amont.
+_STRICT_SOURCE_TYPES = {"presse_specialisee", "presse_locale", "developer"}
+
+# Règle B (dept) : regex codes postaux pour valider le departement.
+_RE_ZIPCODE = re.compile(r'\b(0[1-9]|[1-8]\d|9[0-5]|2[AB])\d{3}\b')
+
+def _wrong_dept(text_norm: str, dept_code: str) -> bool:
+    """True si le texte contient des codes postaux d un autre departement
+    sans aucun code du bon departement.
+    """
+    dept2   = dept_code.lstrip("0")[:2]
+    found   = _RE_ZIPCODE.findall(text_norm)
+    if not found:
+        return False
+    home    = [z for z in found if z.lstrip("0") == dept2 or z == dept_code[:2]]
+    foreign = [z for z in found if z.lstrip("0") != dept2 and z != dept_code[:2]]
+    return bool(foreign) and not bool(home)
+
+# --- 8.6 Extraction principale depuis le texte fetche ------------------------
 
 def extract_candidate_from_text(
-    text:     Optional[str],
-    title:    Optional[str],
-    snippet:  Optional[str],
-    communes: List[dict],
-    enr_type: str,
+    text: Optional[str], title: Optional[str], snippet: Optional[str],
+    communes: List[dict], enr_type: str,
     matched_commune: Optional[str] = None,
+    pub_date: Optional[str] = None,
+    hub_statut: Optional[str] = None,
+    dept_code: Optional[str] = None,
+    source_type: Optional[str] = None,
+    url: Optional[str] = None,
 ) -> dict:
-    """Extraction regex d un candidat projet a partir d un texte fetche.
-    Retourne un dict decrivant le statut et les champs extraits.
+    # Règle 1 : rejeter immediatement les pages de listing
+    if url and _is_listing_url(url):
+        return {"status": "not_relevant", "method": "regex",
+                "is_enr_project": False, "relevance_score": 0.0, "candidate": None}
 
-    Champs du retour :
-      status   : not_relevant | extracted_direct | needs_llm | skipped_no_text
-      method   : 'regex' | None
-      is_enr_project : bool ou None (seulement True si status=extracted_direct)
-      relevance_score : float 0..1
-      candidate : dict projet (nullable) avec les champs extraits
-    """
     if not text or len(text) < 100:
         return {"status": "skipped_no_text", "method": None,
-                "is_enr_project": None, "relevance_score": 0.0,
-                "candidate": None}
+                "is_enr_project": None, "relevance_score": 0.0, "candidate": None}
 
-    # Concatene titre + snippet + texte pour l analyse, pour ne pas rater
-    # un nom de porteur qui serait dans le titre et pas dans le corps.
-    full = " ".join(filter(None, [title or "", snippet or "", text]))
+    full      = " ".join(filter(None, [title or "", snippet or "", text]))
     full_norm = _normalize(full)
+    cf        = _detect_communes_in_text(full_norm, communes)
 
-    communes_found = _detect_communes_in_text(full_norm, communes)
-    relevance = _compute_relevance(full_norm, communes_found, enr_type)
+    # Valider matched_commune contre le texte fetche
+    effective_commune = matched_commune
+    if effective_commune and _normalize(effective_commune) not in full_norm:
+        effective_commune = None
 
-    if relevance < 0.4:
+    rel = _compute_relevance(full_norm, cf, enr_type,
+                             matched_commune=effective_commune)
+    if rel < 0.4:
         return {"status": "not_relevant", "method": "regex",
-                "is_enr_project": False, "relevance_score": relevance,
-                "candidate": None}
+                "is_enr_project": False, "relevance_score": rel, "candidate": None}
 
-    # A partir de la, le texte est pertinent. On tente l extraction directe.
-    power       = _extract_power_mw(full_norm)
-    area        = _extract_area_ha(full_norm)
-    developer   = _detect_developer(full_norm)
-    date_avis   = _extract_date(full)
-    # La commune probable : matched_commune (si fournie via SearXNG) ou la 1ere trouvee
-    commune_main = matched_commune or (communes_found[0] if communes_found else None)
+    # Règle B : departement etranger
+    if dept_code and _wrong_dept(full_norm, dept_code):
+        return {"status": "not_relevant", "method": "regex",
+                "is_enr_project": False, "relevance_score": rel, "candidate": None}
 
-    candidate = {
-        "nom_projet":     title[:200] if title else None,  # meilleur proxy dispo
-        "commune":        commune_main,
-        "communes_all":   communes_found,
+    # Règle 2 + 3 : pour les sources strictes (presse, developer), la commune
+    # du rayon doit apparaitre dans le titre OU dans le chemin de l URL.
+    # - titre : "Projet photovoltaique a Contres" → ok
+    # - URL   : ".../commune/contres/..." → ok
+    # - sinon : article sur un autre sujet mentionnant juste notre commune
+    title_commune = _commune_from_title(title, communes)
+    if source_type in _STRICT_SOURCE_TYPES:
+        url_norm = _normalize(url or "").replace("-", " ").replace("/", " ")
+        commune_in_url = any(
+            len(c["nom"]) >= 4 and _normalize(c["nom"]) in url_norm
+            for c in communes if c.get("nom")
+        )
+        if not title_commune and not commune_in_url:
+            return {"status": "not_relevant", "method": "regex",
+                    "is_enr_project": False, "relevance_score": rel, "candidate": None}
+
+    # Commune authoritative : titre > effective_commune > detection generique
+    cm = title_commune or effective_commune or (cf[0] if cf else None)
+
+    power  = _extract_power_mw(full_norm)
+    area   = _extract_area_ha(full_norm)
+    dev    = _detect_developer(full_norm)
+    statut = _detect_statut(full_norm) or hub_statut
+    date   = _extract_date(full) or _parse_pub_date(pub_date)
+    resume = _extract_resume(text, enr_type)
+
+    cand = {
+        "nom_projet":     _clean_nom_projet(title[:200]) if title else None,
+        "commune":        cm,
+        "communes_all":   cf,
         "type_enr":       enr_type,
         "puissance_mw":   power,
         "superficie_ha":  area,
-        "maitre_ouvrage": developer,
-        "date_annonce":   date_avis,
-        "statut":         None,   # heuristique non fiable, laisser au LLM
-        "resume_court":   None,
-        "confidence":     relevance,
+        "maitre_ouvrage": dev,
+        "date_annonce":   date,
+        "statut":         statut,
+        "resume_court":   resume,
+        "confidence":     rel,
     }
 
-    # Decision : extrait direct ou renvoyer au LLM ?
-    # On considere l extraction suffisante si on a au moins 2 signaux parmi :
-    # (puissance, superficie, porteur).
-    signals = sum(x is not None for x in (power, area, developer))
+    signals = sum(x is not None for x in (power, area, dev))
+
+    # extracted_direct : >= 2 signaux chiffres (puissance, surface, porteur)
     if signals >= 2:
         return {"status": "extracted_direct", "method": "regex",
-                "is_enr_project": True, "relevance_score": relevance,
-                "candidate": candidate}
-    # Sinon : pertinent mais incomplet, a repasser par le LLM
+                "is_enr_project": True, "relevance_score": rel, "candidate": cand}
+
+    # Règle 4 : extracted_partial necessite statut OU signal >= 1.
+    # Le resume seul ne suffit plus (trop permissif pour les articles generaux).
+    if cm and (statut or signals >= 1):
+        return {"status": "extracted_partial", "method": "regex",
+                "is_enr_project": True, "relevance_score": rel, "candidate": cand}
+
     return {"status": "needs_llm", "method": "regex",
-            "is_enr_project": None, "relevance_score": relevance,
-            "candidate": candidate}
+            "is_enr_project": None, "relevance_score": rel, "candidate": cand}
 
 def _extraction_from_internal(url_entry: dict, enr_type: str) -> dict:
-    """Shortcut pour les URLs internal:// : les metadonnees sont deja dans
-    'extra' (remplies par get_internal_avis). On fabrique un candidat
-    directement sans regex ni LLM.
-    """
     extra = url_entry.get("extra") or {}
-    candidate = {
-        "nom_projet":     url_entry.get("title"),
+    cand  = {
+        "nom_projet":     _clean_nom_projet(url_entry.get("title") or ""),
         "commune":        url_entry.get("matched_commune"),
         "communes_all":   [url_entry.get("matched_commune")] if url_entry.get("matched_commune") else [],
         "type_enr":       enr_type,
@@ -1761,75 +1271,51 @@ def _extraction_from_internal(url_entry: dict, enr_type: str) -> dict:
         "date_annonce":   extra.get("date_avis"),
         "statut":         extra.get("avis_type"),
         "resume_court":   url_entry.get("snippet"),
-        "confidence":     1.0,   # source interne = confiance max
+        "confidence":     1.0,
         "mrae_ref":       extra.get("reference_cle"),
         "mrae_pdf":       extra.get("pdf_path"),
     }
-    return {"status": "internal", "method": "internal",
-            "is_enr_project": True, "relevance_score": 1.0,
-            "candidate": candidate}
+    return {"status":"internal","method":"internal","is_enr_project":True,
+            "relevance_score":1.0,"candidate":cand}
+
+# --- 8.6 Persistance et orchestration extraction -----------------------------
 
 def _save_extraction(job_id: str, url: str, result: dict, duration: float,
                      error: Optional[str] = None) -> None:
-    """INSERT ou UPDATE d une extraction en base."""
     conn = get_db()
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO news.url_extractions
-                    (url, job_id, status, method, is_enr_project,
-                     relevance_score, candidate, duration, error)
-                VALUES (%(url)s, %(job_id)s, %(status)s, %(method)s,
-                        %(is_enr_project)s, %(relevance_score)s,
-                        %(candidate)s::jsonb, %(duration)s, %(error)s)
-                ON CONFLICT (url, job_id) DO UPDATE SET
-                    status          = EXCLUDED.status,
-                    method          = EXCLUDED.method,
-                    is_enr_project  = EXCLUDED.is_enr_project,
-                    relevance_score = EXCLUDED.relevance_score,
-                    candidate       = EXCLUDED.candidate,
-                    duration        = EXCLUDED.duration,
-                    error           = EXCLUDED.error,
-                    extracted_at    = NOW()
+                INSERT INTO news.job_results
+                    (url,job_id,status,method,is_enr_project,
+                     relevance_score,candidate,duration,error)
+                VALUES(%(url)s,%(job_id)s,%(status)s,%(method)s,%(is_enr_project)s,
+                       %(relevance_score)s,%(candidate)s::jsonb,%(duration)s,%(error)s)
+                ON CONFLICT(url,job_id) DO UPDATE SET
+                    status=EXCLUDED.status,method=EXCLUDED.method,
+                    is_enr_project=EXCLUDED.is_enr_project,
+                    relevance_score=EXCLUDED.relevance_score,
+                    candidate=EXCLUDED.candidate,duration=EXCLUDED.duration,
+                    error=EXCLUDED.error,extracted_at=NOW()
                 """,
-                {
-                    "url": url, "job_id": job_id,
-                    "status":          result["status"],
-                    "method":          result.get("method"),
-                    "is_enr_project":  result.get("is_enr_project"),
-                    "relevance_score": result.get("relevance_score"),
-                    "candidate":       json.dumps(result.get("candidate")) if result.get("candidate") else None,
-                    "duration":        duration,
-                    "error":           error,
-                },
+                {"url":url,"job_id":job_id,"status":result["status"],
+                 "method":result.get("method"),"is_enr_project":result.get("is_enr_project"),
+                 "relevance_score":result.get("relevance_score"),
+                 "candidate":json.dumps(result.get("candidate")) if result.get("candidate") else None,
+                 "duration":duration,"error":error},
             )
             conn.commit()
     finally:
         conn.close()
 
-def extract_all_candidates(
-    job_id:        str,
-    urls:          List[dict],
-    fetched_by_url: dict,
-    communes:      List[dict],
-    enr_type:      str,
-) -> dict:
-    """Lance l extraction regex sur toutes les URLs du job.
-    Met a jour la table news.url_extractions.
-    Retourne des statistiques agregees.
-    """
-    stats = {
-        "total":            len(urls),
-        "not_relevant":     0,
-        "extracted_direct": 0,
-        "needs_llm":        0,
-        "internal":         0,
-        "skipped_no_text":  0,
-        "error":            0,
-    }
+def extract_all_candidates(job_id: str, urls: List[dict], fetched_by_url: dict,
+                           communes: List[dict], enr_type: str,
+                           dept_code: Optional[str] = None) -> dict:
+    """Phase 4b : extraction regex (puissance, surface, porteur, date, statut, resume)."""
+    stats = {"total":len(urls),"not_relevant":0,"extracted_direct":0,
+             "needs_llm":0,"internal":0,"skipped_no_text":0,"error":0}
     start = time.time()
-
     for u in urls:
         url = u["url"]
         t0  = time.time()
@@ -1837,219 +1323,359 @@ def extract_all_candidates(
             if url.startswith("internal://"):
                 result = _extraction_from_internal(u, enr_type)
             else:
-                cache_entry = fetched_by_url.get(url)
-                text = cache_entry.get("text") if cache_entry else None
+                cache  = fetched_by_url.get(url)
                 result = extract_candidate_from_text(
-                    text=text,
-                    title=u.get("title"),
-                    snippet=u.get("snippet"),
-                    communes=communes,
-                    enr_type=enr_type,
+                    text=cache.get("text") if cache else None,
+                    title=u.get("title"), snippet=u.get("snippet"),
+                    communes=communes, enr_type=enr_type,
                     matched_commune=u.get("matched_commune"),
+                    pub_date=u.get("pub_date"),
+                    hub_statut=u.get("hub_statut"),
+                    dept_code=dept_code,
+                    source_type=u.get("source_type"),
+                    url=url,
                 )
-            duration = time.time() - t0
-            _save_extraction(job_id, url, result, duration)
+            _save_extraction(job_id, url, result, time.time()-t0)
             stats[result["status"]] = stats.get(result["status"], 0) + 1
         except Exception as e:
-            duration = time.time() - t0
-            logger.exception("Echec extraction pour {}".format(url))
-            _save_extraction(
-                job_id, url,
-                {"status": "error", "method": None, "is_enr_project": None,
-                 "relevance_score": 0.0, "candidate": None},
-                duration,
-                error=str(e)[:500],
-            )
+            logger.exception("Echec extraction {}".format(url))
+            _save_extraction(job_id, url,
+                {"status":"error","method":None,"is_enr_project":None,
+                 "relevance_score":0.0,"candidate":None},
+                time.time()-t0, error=str(e)[:500])
             stats["error"] += 1
-
-    elapsed = time.time() - start
-    logger.info("  Extraction regex : {} URLs en {:.1f}s "
-                "(direct={}, needs_llm={}, internal={}, not_relevant={}, "
-                "skipped={}, errors={})".format(
-                    len(urls), elapsed,
-                    stats["extracted_direct"], stats["needs_llm"],
-                    stats["internal"], stats["not_relevant"],
-                    stats["skipped_no_text"], stats["error"]))
+    logger.info("  Regex : {} URLs en {:.1f}s (direct={},needs_llm={},internal={},"
+                "not_relevant={},skipped={},err={})".format(
+                    len(urls), time.time()-start,
+                    stats["extracted_direct"], stats["needs_llm"], stats["internal"],
+                    stats["not_relevant"], stats["skipped_no_text"], stats["error"]))
     return stats
 
-def collect_urls_for_sources(
-    sources:             List[dict],
-    communes_all:        List[dict],
-    communes_for_search: List[dict],
-    enr_type:            str,
-    enr_label:           str,
-) -> List[dict]:
-    """
-    Collecte les URLs candidates pour chaque source :
-      - is_internal=true  : requete SQL directe sur toutes les communes_all
-                            (requete locale, coute rien, on prend large)
-      - sinon             : recherche SearXNG en parallele sur les
-                            communes_for_search (tronquees aux N plus proches
-                            pour limiter la charge moteurs)
+# ==============================================================================
+#  9. PHASES 5-8 : CONSOLIDATION ET EXPORT
+#     Filtre ENR, regroupement par projet, export CSV.
+# ==============================================================================
 
-    Renvoie une liste dedupliquee par URL (la premiere occurrence est gardee).
-    Les resultats internes portent un champ 'extra' avec les metadonnees MRAE.
-    """
-    collected = []
+def _filter_enr_projects(projects: List[dict]) -> List[dict]:
+    """Phase 5 : filtre ENR — conserve uniquement photovoltaique, agrivoltaique, eolien."""
+    out = []
+    for p in projects:
+        # 1. Champ type_enr renseigne et dans la cible
+        if p.get("type_enr") in ENR_TYPES_TARGET:
+            out.append(p)
+            continue
+        # 2. Fallback : presence de mots-cles ENR cible dans titre ou resume
+        haystack = _normalize(
+            (p.get("nom_projet") or "") + " " + (p.get("resume_court") or ""))
+        if any(k in haystack for k in ENR_KEYWORDS_TARGET):
+            out.append(p)
+    return out
 
-    # --- 1. Sources internes : utiliser TOUTES les communes du rayon -----------
-    internal_sources = [s for s in sources if s.get("is_internal")]
-    for s in internal_sources:
-        avis_list = get_internal_avis(communes_all, enr_type)
-        logger.info("  internal '{}' : {} avis MRAE trouves "
-                    "(sur {} communes du rayon)".format(
-            s["domain"], len(avis_list), len(communes_all)
+def consolidate_projects(projects: List[dict]) -> List[dict]:
+    """Phase 6 : regroupe les candidats par projet unique (1 ligne = 1 projet).
+
+    Cle de regroupement :
+      - commune + type_enr + porteur normalise        (cas principal)
+      - commune + type_enr + mots-cles nom_projet     (fallback si porteur absent)
+      - commune + type_enr + source_url               (dernier recours : ligne unique)
+
+    Pour chaque groupe :
+      - La source de meilleure priorite fournit les champs de base.
+      - Les champs manquants sont completes depuis les autres sources.
+      - Toutes les URLs sont conservees dans `sources`.
+    """
+    _PRIORITY  = {"internal":1,"extracted_direct":2,"extracted_llm":3,"extracted_partial":4}
+    _STOP_WORDS = {"projet","de","d","la","le","les","du","des","une","un","sur","au",
+                   "aux","en","et","l","creation","realisation","construction",
+                   "installation","centrale","parc","ferme","solaire","energie"}
+    _FILLABLE  = ("puissance_mw","superficie_ha","maitre_ouvrage",
+                  "date_annonce","statut","resume_court","nom_projet")
+
+    def _kw(s: str) -> frozenset:
+        words = _normalize(s or "").split()
+        return frozenset(w for w in words if w not in _STOP_WORDS and len(w) > 3)
+
+    def _group_key(p: dict) -> str:
+        commune = _normalize(p.get("commune") or "")
+        enr     = p.get("type_enr") or ""
+        porteur = _normalize(p.get("maitre_ouvrage") or "")
+        if porteur:
+            return "{}|{}|{}".format(commune, enr, porteur)
+        kw = _kw(p.get("nom_projet") or "")
+        if len(kw) >= 2:
+            return "{}|{}|{}".format(commune, enr, "|".join(sorted(kw)[:4]))
+        return "{}|{}|{}".format(commune, enr, p.get("source_url", ""))
+
+    # Groupement
+    groups: dict = {}
+    for p in projects:
+        key = _group_key(p)
+        groups.setdefault(key, []).append(p)
+
+    # Fusion de chaque groupe
+    consolidated = []
+    for group in groups.values():
+        # Trier par priorite de source (meilleure en premier)
+        group.sort(key=lambda p: (
+            _PRIORITY.get(p.get("source_status", ""), 99),
+            -sum(1 for f in _FILLABLE if p.get(f)),
         ))
-        for a in avis_list:
-            collected.append({
-                "source_id":       s["source_id"],
-                "domain":          s["domain"],
-                "niveau":          s["niveau"],
-                "method":          "internal",
-                "url":             "internal://{}/{}".format(s["domain"], a["avis_id"]),
-                "title":           a["nom_projet"] or "(sans titre)",
-                "snippet":         (a["resume"] or "")[:500],
-                "matched_commune": a["matched_commune"],
-                "extra": {
-                    "avis_id":         a["avis_id"],
-                    "reference_cle":   a["reference_cle"],
-                    "date_avis":       a["date_avis"].isoformat() if a["date_avis"] else None,
-                    "avis_type":       a["avis_type"],
-                    "maitre_ouvrage":  a["maitre_ouvrage"],
-                    "puissance_mw":    float(a["puissance_mw"]) if a["puissance_mw"] is not None else None,
-                    "superficie_ha":   float(a["superficie_ha"]) if a["superficie_ha"] is not None else None,
-                    "location":        a["location"],
-                    "poste_connexion": a["poste_connexion"],
-                    "pdf_path":        a["pdf_path"],
+        base = dict(group[0])
+
+        # Completer les champs manquants depuis les sources suivantes
+        for other in group[1:]:
+            for field in _FILLABLE:
+                if not base.get(field) and other.get(field):
+                    base[field] = other[field]
+
+        # Consolider les sources
+        base["sources"]      = [p["source_url"] for p in group]
+        base["source_count"] = len(group)
+        base["source_status"] = group[0].get("source_status", "")
+        consolidated.append(base)
+
+    return consolidated
+
+_LLM_NAMES_SYSTEM = (
+    "Tu normalises des noms de projets ENR francais. "
+    "SUPPRIMER : communes, codes departement, puissances (MWc/MW), verbes admin "
+    "(Projet de, Creation d une, Realisation d un(e), Construction d un(e), Implantation). "
+    "CONSERVER : type de projet (Centrale PV / Centrale photovoltaique / Parc photovoltaique / "
+    "Parc eolien / Centrale eolienne / Projet agrivoltaique) + lieu-dit ou nom specifique si present. "
+    "FORMAT : 'Type' ou 'Type - Lieu-dit'. "
+    "Si le nom ne contient pas de type ENR reconnaissable, renvoie-le tel quel. "
+    "Reponds UNIQUEMENT avec {\"r\": [\"nom1\", \"nom2\", ...]} dans le meme ordre que l entree, "
+    "sans commentaire ni texte supplementaire."
+)
+
+def _call_llm_names(names: List[str]) -> Optional[List[str]]:
+    """Appel Ollama batch pour normaliser les noms de projets ENR.
+
+    Retourne la liste normalisee (meme longueur que l entree) ou None si echec.
+    Temperature 0 pour une sortie deterministe et stable.
+    """
+    if not names:
+        return []
+    prompt = "Normalise ces noms :\n" + json.dumps(names, ensure_ascii=False, indent=None)
+    raw = ""
+    try:
+        resp = httpx.post(
+            "{}/api/generate".format(OLLAMA_HOST),
+            json={
+                "model":  OLLAMA_MODEL,
+                "system": _LLM_NAMES_SYSTEM,
+                "prompt": prompt,
+                "format": "json",
+                "stream": False,
+				"keep_alive": "5m",
+                "options": {
+                    "temperature": 0,
+                    "num_predict": 512,
+                    "num_ctx":    2048,
                 },
-            })
+            },
+            timeout=OLLAMA_TIMEOUT_NAMES,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("response", "").strip()
+        if raw.startswith("```"):
+            raw = raw.lstrip("`").lstrip("json").strip().rstrip("`").strip()
+        parsed = json.loads(raw)
+        # Accepter plusieurs cles possibles en sortie
+        result = (parsed.get("r") or parsed.get("results") or
+                  parsed.get("noms") or parsed.get("names"))
+        if not isinstance(result, list):
+            logger.warning("LLM noms : reponse sans liste | raw={!r:.80}".format(raw[:80]))
+            return None
+        if len(result) != len(names):
+            logger.warning("LLM noms : longueur {} vs {} attendus".format(
+                len(result), len(names)))
+            return None
+        return [str(n).strip() or names[i] for i, n in enumerate(result)]
+    except json.JSONDecodeError as e:
+        logger.warning("LLM noms JSON invalide : {} | raw={!r:.80}".format(e, raw[:80]))
+        return None
+    except Exception as e:
+        logger.warning("LLM noms echec : {}".format(e))
+        return None
 
-    # --- 2. Sources en mode crawl_index : fetch direct de leur page d index ----
-    # Une seule requete HTTP par source (pas par commune), parsing des liens,
-    # filtrage cote Python sur (commune | mot-cle ENR). Pas de dependance
-    # SearXNG, donc pas de quota a craindre.
-    #
-    # Lazy refresh : pour les prefectures dont hubs_discovered_at est NULL ou
-    # > HUB_TTL_DAYS, on relance discover_hubs_for_domain() AVANT le crawl
-    # (cout : 30-90s, paye une fois par TTL). Toutes les autres avancent
-    # immediatement avec les hubs deja en base.
-    crawl_sources = [s for s in sources
-                     if s.get("discovery_mode") == "crawl_index"]
-    if crawl_sources:
-        enr_keywords = _enr_keywords_for_type(enr_type, enr_label)
-        logger.info("  crawl_index : {} sources a fetcher".format(len(crawl_sources)))
-        start = time.time()
-        for s in crawl_sources:
+def _apply_llm_names(projects: List[dict]) -> List[dict]:
+    """Normalise les nom_projet de tous les projets via un seul appel LLM batch.
+
+    Pipeline :
+      1. Soumet tous les noms en un appel unique (rapide meme pour 20 projets)
+      2. Valide que la reponse a la meme longueur que l entree
+      3. Applique seulement les noms non vides (>= 5 chars)
+      4. Fallback transparent : conserve le nom existant en cas d echec partiel
+
+    Branche uniquement si OLLAMA_ENABLED=true.
+    """
+    if not projects:
+        return projects
+
+    names_in  = [p.get("nom_projet") or "" for p in projects]
+    t0 = time.time()
+    logger.info("  LLM noms : {} projets -> {}".format(len(names_in), OLLAMA_HOST))
+
+    names_out = _call_llm_names(names_in)
+
+    if names_out is None:
+        logger.warning("  LLM noms : echec, noms originaux conserves")
+        return projects
+
+    applied = 0
+    for p, new_name in zip(projects, names_out):
+        if new_name and len(new_name) >= 5:
+            p["nom_projet"] = new_name
+            applied += 1
+
+    logger.info("  LLM noms : {}/{} noms normalises en {:.1f}s".format(
+        applied, len(projects), time.time() - t0))
+    return projects
+
+def _export_projects_file(projects: List[dict], job_id: str,
+                           commune: str, dept_code: str,
+                           radius_km: int) -> Optional[str]:
+    """Phase 8 : export CSV (separateur ;, encodage utf-8-sig pour Excel FR)."""
+    import csv, os
+    out_dir = "/app/output"
+    os.makedirs(out_dir, exist_ok=True)
+
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = "projects_{}_{}_{}km_{}.csv".format(
+        commune.replace(" ", "-"), dept_code, radius_km, ts)
+    filepath = os.path.join(out_dir, filename)
+
+    fieldnames = ["commune","distance","nom_projet","puissance_mw","superficie_ha",
+                  "maitre_ouvrage","statut","date_annonce","resume_court",
+                  "source_count","sources","source_status"]
+
+    TEXT_FIELDS = {"nom_projet", "maitre_ouvrage", "resume_court"}
+
+    def _clean_row(p: dict) -> dict:
+        row = {}
+        for f in fieldnames:
+            v = p.get(f)
+            if v is None:
+                row[f] = ""
+            elif f == "sources":
+                # Liste d URLs separees par |
+                row[f] = " | ".join(v) if isinstance(v, list) else (v or "")
+            elif f in TEXT_FIELDS and isinstance(v, str):
+                row[f] = " ".join(v.split())
+            else:
+                row[f] = v
+        return row
+
+    try:
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore",
+                               delimiter=";")
+            w.writeheader()
+            w.writerows(_clean_row(p) for p in projects)
+        logger.info("  Export CSV : {}".format(filepath))
+        return filepath
+    except Exception as e:
+        logger.warning("  Export CSV KO : {}".format(e))
+        return None
+
+def _build_project_summary(job_id: str, communes: List[dict]) -> List[dict]:
+    """Construit la liste des projets detectes pour un job, triee par distance."""
+    conn = get_db()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT url, status, method, candidate
+                FROM news.job_results
+                WHERE job_id = %s
+                  AND status IN ('internal','extracted_direct',
+                                 'extracted_partial','extracted_llm')
+                ORDER BY
+                    CASE status
+                        WHEN 'internal'          THEN 1
+                        WHEN 'extracted_direct'  THEN 2
+                        WHEN 'extracted_llm'     THEN 3
+                        WHEN 'extracted_partial' THEN 4
+                    END
+                """,
+                (job_id,),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+    # Index des communes par nom pour retrouver la distance
+    commune_by_nom = {c["nom"]: c for c in communes}
+
+    projects = []
+    for row in rows:
+        cand = row.get("candidate") or {}
+        if isinstance(cand, str):
             try:
-                # Refresh lazy si stale ou pas encore decouvert
-                _ensure_hubs_fresh(s)
-                if not s.get("index_urls"):
-                    logger.info("    {} : aucun hub disponible, skip"
-                                .format(s["domain"]))
-                    continue
-                hits = _crawl_index_task(s, communes_all, enr_keywords)
-                collected.extend(hits)
-                logger.info("    {} : {} hits".format(s["domain"], len(hits)))
+                cand = json.loads(cand)
             except Exception:
-                logger.exception("Echec crawl_index pour {}".format(s["domain"]))
-        elapsed = time.time() - start
-        logger.info("  crawl_index : termine en {:.1f}s".format(elapsed))
+                cand = {}
 
-    # --- 3. Sources externes en mode searxng_site -----------------------------
-    # On exclut :
-    #  - is_internal=true (deja traitees en phase 1)
-    #  - domain='*' (free_search, traite en phase 4)
-    #  - discovery_mode='crawl_index' (deja traite en phase 2)
-    external_sources = [s for s in sources
-                        if not s.get("is_internal")
-                        and s.get("domain") != "*"
-                        and s.get("discovery_mode") != "crawl_index"]
-    tasks = [(s, c) for s in external_sources for c in communes_for_search]
+        commune_nom = cand.get("commune") or "?"
+        c_info      = commune_by_nom.get(commune_nom)
+        dist_str    = ""
+        if c_info:
+            dist_km  = (c_info["distance_m"] or 0) / 1000
+            dist_str = "{:.1f} km".format(dist_km)
 
-    if tasks:
-        logger.info("  SearXNG site: {} requetes (concurrency={}, "
-                    "{} communes x {} sources)".format(
-            len(tasks), SEARXNG_CONCURRENCY,
-            len(communes_for_search), len(external_sources)
-        ))
-        start = time.time()
-        with ThreadPoolExecutor(max_workers=SEARXNG_CONCURRENCY) as pool:
-            futures = {
-                pool.submit(_searxng_task, s, c, enr_label): (s, c)
-                for s, c in tasks
-            }
-            for fut in as_completed(futures):
-                try:
-                    collected.extend(fut.result())
-                except Exception:
-                    s, c = futures[fut]
-                    logger.exception("Echec tache searxng {}/{}".format(
-                        s["domain"], c["nom"]))
-        elapsed = time.time() - start
-        logger.info("  SearXNG site: {} requetes terminees en {:.1f}s".format(
-            len(tasks), elapsed
-        ))
+        projects.append({
+            "nom_projet":     (cand.get("nom_projet") or "?")[:80],
+            "commune":        commune_nom,
+            "distance":       dist_str,
+            "puissance_mw":   cand.get("puissance_mw"),
+            "superficie_ha":  cand.get("superficie_ha"),
+            "maitre_ouvrage": cand.get("maitre_ouvrage"),
+            "statut":         cand.get("statut"),
+            "date_annonce":   cand.get("date_annonce"),
+            "resume_court":   (cand.get("resume_court") or "")[:200],
+            "source_url":     row["url"],
+            "source_status":  row["status"],
+            "confidence":     cand.get("confidence"),
+        })
 
-    # --- 4. Recherche libre : 1 requete SearXNG SANS site: par commune --------
-    # Permet de decouvrir des URLs hors du registre de sources (sites mairie,
-    # presse locale non listee, prefectures nouvellement trouvees, etc.).
-    # Les URLs remontees sont attribuees a la pseudo-source '*' (free_search).
-    free_source = next((s for s in sources if s.get("domain") == "*"), None)
-    if free_source:
-        free_tasks = list(communes_for_search)
-        logger.info("  SearXNG libre : {} requetes (1 par commune)".format(
-            len(free_tasks)
-        ))
-        start = time.time()
-        with ThreadPoolExecutor(max_workers=SEARXNG_CONCURRENCY) as pool:
-            futures = {
-                pool.submit(_searxng_free_task, free_source, c, enr_label): c
-                for c in free_tasks
-            }
-            for fut in as_completed(futures):
-                try:
-                    collected.extend(fut.result())
-                except Exception:
-                    c = futures[fut]
-                    logger.exception("Echec tache searxng libre pour {}".format(
-                        c["nom"]))
-        elapsed = time.time() - start
-        logger.info("  SearXNG libre : {} requetes terminees en {:.1f}s".format(
-            len(free_tasks), elapsed
-        ))
+    # Trier par distance croissante
+    def _dist_key(p):
+        try:
+            return float(p["distance"].replace(" km", ""))
+        except Exception:
+            return 999.0
 
-    # --- 4. Dedup par URL (garde la premiere occurrence) -----------------------
-    # Ordre de priorite : sources internal > site: > free_search
-    # (grace a l ordre d insertion dans `collected`).
-    seen = set()
-    unique = []
-    for c in collected:
-        if c["url"] not in seen:
-            seen.add(c["url"])
-            unique.append(c)
+    projects = sorted(projects, key=_dist_key)
 
-    return unique
+    before_filter = len(projects)
+    projects = _filter_enr_projects(projects)
+    before_consol = len(projects)
+    projects = consolidate_projects(projects)
+
+    if OLLAMA_ENABLED:
+        projects = _apply_llm_names(projects)
+
+    logger.info("  Resume : {} bruts -> {} apres filtre ENR -> {} apres consolidation".format(
+        before_filter, before_consol, len(projects)))
+
+    return projects
 
 # ==============================================================================
-#  Traitement d un job
+#  10. ORCHESTRATION JOB
+#      Prend en charge un job depuis la queue Redis jusqu a l export CSV.
 # ==============================================================================
 
 def process_job(r, job_id: str) -> None:
     logger.info("=== Job {} ===".format(job_id))
-
     job = _load_job(r, job_id)
     if job is None:
-        logger.error("Job {} introuvable dans Redis, ignore".format(job_id))
+        logger.error("Job {} introuvable".format(job_id))
         return
 
-    # Passage en processing
-    started    = _now_iso()
-    t0         = time.monotonic()   # pour mesurer la duree reelle du traitement
-    _update_job(r, job_id,
-        status="processing",
-        started_at=started,
-        progress={"step": "consulting_registry", "sources_found": 0},
-    )
+    t0 = time.monotonic()
+    _update_job(r, job_id, status="processing", started_at=_now_iso(),
+                progress={"step":"consulting_registry"})
 
     commune   = job["commune"]
     dept_code = job["dept_code"]
@@ -2058,233 +1684,162 @@ def process_job(r, job_id: str) -> None:
     region    = region_of(dept_code)
 
     if region is None:
-        logger.warning("Region inconnue pour dept_code={} -- seules les sources nationales seront considerees".format(dept_code))
-    logger.info("Traitement : {} (dept={}, region={}) type={} radius={}km".format(
-        commune, dept_code, region or "?", enr_type, radius_km
-    ))
+        logger.warning("Region inconnue pour dept_code={}".format(dept_code))
+    logger.info("Traitement : {} (dept={}, region={}) type={} r={}km".format(
+        commune, dept_code, region or "?", enr_type, radius_km))
 
     try:
-        # --- Etape 1 : consultation du registre de sources -------------------
-        sources = get_candidate_sources(dept_code, enr_type)
+        # Etape 1 : sources
+        sources   = get_candidate_sources(dept_code, enr_type)
         enr_label = get_enr_label(enr_type)
-
-        logger.info("  {} sources candidates (label='{}')".format(len(sources), enr_label))
+        logger.info("  {} sources (label='{}')".format(len(sources), enr_label))
         for s in sources[:3]:
             logger.info("    {:>5.2f}  {:<35}  ({})".format(
-                s["final_score"], s["domain"], s["niveau"]
-            ))
+                s["final_score"], s["domain"], s["niveau"]))
         if len(sources) > 3:
-            logger.info("    ... et {} autres".format(len(sources) - 3))
+            logger.info("    ... et {} autres".format(len(sources)-3))
 
-        # --- Etape 2 : communes cibles dans le rayon -------------------------
-        _update_job(r, job_id,
-            progress={"step": "resolving_communes", "sources_found": len(sources)},
-        )
+        # Etape 2 : communes
+        _update_job(r, job_id, progress={"step":"resolving_communes","sources_found":len(sources)})
         communes = get_target_communes(commune, dept_code, radius_km)
-
         if not communes:
-            logger.warning("Commune '{}' (dept {}) introuvable dans sig.communes -- "
-                           "fallback sur la commune seule".format(commune, dept_code))
-            # Fallback : on cherche au moins sur la commune telle qu'indiquee
-            communes = [{
-                "insee_com": None, "nom": commune, "population": None,
-                "distance_m": 0.0, "is_origin": True,
-            }]
-
-        logger.info("  {} communes dans un rayon de {} km".format(
-            len(communes), radius_km
-        ))
-        # Liste tronquee pour SearXNG (les N plus proches, limite charge moteurs)
+            logger.warning("Commune '{}' introuvable -- fallback".format(commune))
+            communes = [{"insee_com":None,"nom":commune,"population":None,
+                         "distance_m":0.0,"is_origin":True}]
+        logger.info("  {} communes dans {}km".format(len(communes), radius_km))
         communes_for_search = communes
         if MAX_COMMUNES_PER_JOB > 0 and len(communes) > MAX_COMMUNES_PER_JOB:
             communes_for_search = communes[:MAX_COMMUNES_PER_JOB]
-            logger.info("  -> SearXNG limite aux {} plus proches (MAX_COMMUNES_PER_JOB)".format(
-                MAX_COMMUNES_PER_JOB
-            ))
         for c in communes[:5]:
-            logger.info("    {:>6.0f} m  {}".format(c["distance_m"], c["nom"]))
+            logger.info("    {:>6.0f}m  {}".format(c["distance_m"], c["nom"]))
         if len(communes) > 5:
-            logger.info("    ... et {} autres".format(len(communes) - 5))
+            logger.info("    ... et {} autres".format(len(communes)-5))
 
-        # --- Etape 3 : recherche web via SearXNG -----------------------------
-        _update_job(r, job_id,
-            progress={
-                "step":            "searching_web",
-                "sources_found":   len(sources),
-                "communes_target": len(communes),
-            },
-        )
-        urls = collect_urls_for_sources(
-            sources=sources,
-            communes_all=communes,
+        # Etape 3 : collecte (Phases 1 + 2 + 3)
+        _update_job(r, job_id, progress={"step":"searching_web","communes_target":len(communes)})
+        urls      = collect_urls_for_sources(
+            sources=sources, communes_all=communes,
             communes_for_search=communes_for_search,
-            enr_type=enr_type,
-            enr_label=enr_label,
+            enr_type=enr_type, enr_label=enr_label,
         )
-
-        # Statistiques par methode de collecte
-        by_method = {"internal": 0, "crawl_index": 0, "searxng": 0, "free_search": 0}
+        by_method = {"internal":0,"crawl_index":0,"searxng":0,"free_search":0}
         for u in urls:
-            by_method[u["method"]] = by_method.get(u["method"], 0) + 1
-
-        logger.info("  {} URLs collectees (internal={}, crawl_index={}, "
-                    "searxng={}, free={})".format(
+            by_method[u["method"]] = by_method.get(u["method"],0) + 1
+        logger.info("  {} URLs (int={},crawl={},searxng={},free={})".format(
             len(urls), by_method["internal"], by_method["crawl_index"],
-            by_method["searxng"], by_method["free_search"]
-        ))
+            by_method["searxng"], by_method["free_search"]))
 
-        # --- Etape 4a : fetch des contenus HTML/PDF --------------------------
-        _update_job(r, job_id,
-            progress={
-                "step":            "fetching_content",
-                "sources_found":   len(sources),
-                "communes_target": len(communes),
-                "urls_found":      len(urls),
-            },
-        )
-        unique_urls = [u["url"] for u in urls]
-        fetched = fetch_urls_parallel(unique_urls)
-        fetch_stats = fetched["stats"]
+        # Etape 4a : fetch
+        _update_job(r, job_id, progress={"step":"fetching_content","urls_found":len(urls)})
+        fetched        = fetch_urls_parallel([u["url"] for u in urls])
+        fetch_stats    = fetched["stats"]
         fetched_by_url = fetched["results"]
-
-        # Enrichir chaque URL avec ses metadonnees de fetch (sans le texte complet
-        # pour ne pas gonfler le JSON ; le texte reste accessible via url_cache)
         for u in urls:
             f = fetched_by_url.get(u["url"])
-            if f is None:
-                u["fetch"] = {"method": "skipped", "reason": "internal"}
-            else:
-                u["fetch"] = {
-                    "method":         f.get("fetch_method"),
-                    "http_status":    f.get("http_status"),
-                    "content_type":   f.get("content_type"),
-                    "text_length":    f.get("text_length"),
-                    "fetch_duration": round(f.get("fetch_duration") or 0.0, 2),
-                    "from_cache":     f.get("from_cache", False),
-                    "error":          f.get("error"),
-                }
+            u["fetch"] = ({"method":"skipped","reason":"internal"} if f is None else {
+                "method":f.get("fetch_method"),"http_status":f.get("http_status"),
+                "content_type":f.get("content_type"),"text_length":f.get("text_length"),
+                "fetch_duration":round(f.get("fetch_duration") or 0.0, 2),
+                "from_cache":f.get("from_cache",False),"error":f.get("error"),
+            })
 
-        # --- Etape 4b-1 : pre-extraction regex des candidats projets ---------
-        _update_job(r, job_id,
-            progress={
-                "step":            "extracting_candidates",
-                "sources_found":   len(sources),
-                "communes_target": len(communes),
-                "urls_found":      len(urls),
-                "urls_fetched":    fetch_stats["fetched"] + fetch_stats["cached"],
-            },
-        )
+        # Etape 4b : extraction regex
+        _update_job(r, job_id, progress={"step":"extracting_candidates","urls_found":len(urls)})
         extract_stats = extract_all_candidates(
-            job_id=job_id,
-            urls=urls,
-            fetched_by_url=fetched_by_url,
-            communes=communes,
-            enr_type=enr_type,
+            job_id=job_id, urls=urls, fetched_by_url=fetched_by_url,
+            communes=communes, enr_type=enr_type, dept_code=dept_code,
         )
 
-        # --- Resultat final ---------------------------------------------------
+        # Comptage final
+        total_candidates = (extract_stats["extracted_direct"]
+                            + extract_stats["internal"]
+                            + extract_stats.get("extracted_partial", 0))
+
         result = {
-            "commune":          commune,
-            "dept_code":        dept_code,
-            "enr_type":         enr_type,
-            "enr_label":        enr_label,
-            "radius_km":        radius_km,
-            "sources":          sources,
-            "total_sources":    len(sources),
-            "target_communes":  communes,
-            "total_communes":   len(communes),
-            "urls":             urls,
-            "total_urls":       len(urls),
-            "urls_by_method":   by_method,
-            "fetch_stats":      fetch_stats,
-            "extract_stats":    extract_stats,
-            "note":             "Etape 4b-1 -- URLs fetchees + pre-extraction regex, pas encore de LLM",
+            "commune":commune,"dept_code":dept_code,"enr_type":enr_type,
+            "enr_label":enr_label,"radius_km":radius_km,
+            "sources":sources,"total_sources":len(sources),
+            "target_communes":communes,"total_communes":len(communes),
+            "urls":urls,"total_urls":len(urls),"urls_by_method":by_method,
+            "fetch_stats":fetch_stats,"extract_stats":extract_stats,
+            "total_candidates":total_candidates,
         }
 
-        _update_job(r, job_id,
-            status="done",
-            finished_at=_now_iso(),
-            result=result,
-            progress={
-                "step":            "done",
-                "sources_found":   len(sources),
-                "communes_target": len(communes),
-                "urls_found":      len(urls),
-                "urls_fetched":    fetch_stats["fetched"] + fetch_stats["cached"],
-                "candidates":      extract_stats["extracted_direct"] + extract_stats["internal"],
-                "needs_llm":       extract_stats["needs_llm"],
-            },
+        _update_job(r, job_id, status="done", finished_at=_now_iso(), result=result,
+                    progress={"step":"done","candidates":total_candidates})
+
+        # Phases 5-8 : consolidation et export
+        projects = _build_project_summary(job_id, communes)
+        result["projects"] = projects
+
+        csv_path = _export_projects_file(
+            projects, job_id, commune, dept_code, radius_km)
+        if csv_path:
+            result["export_csv"] = csv_path
+
+        logger.info(
+            "Job {} fini en {:.1f}s : {} communes -> {} URLs -> "
+            "{} fetch -> {} projets consolides (export: {})".format(
+                job_id[:8], time.monotonic()-t0, len(communes), len(urls),
+                fetch_stats["html"]+fetch_stats["pdf"],
+                len(projects), csv_path or "KO",
+            )
         )
-        logger.info("Job {} termine en {:.1f}s : {} sources x {} communes -> "
-                    "{} URLs -> {} fetch OK -> {} candidats directs, "
-                    "{} a traiter par LLM".format(
-            job_id, time.monotonic() - t0, len(sources), len(communes),
-            len(urls),
-            fetch_stats["html"] + fetch_stats["pdf"],
-            extract_stats["extracted_direct"] + extract_stats["internal"],
-            extract_stats["needs_llm"],
-        ))
 
     except Exception as e:
-        logger.exception("Erreur lors du traitement du job {} (apres {:.1f}s)".format(
-            job_id, time.monotonic() - t0
-        ))
-        _update_job(r, job_id,
-            status="error",
-            finished_at=_now_iso(),
-            error=str(e)[:500],
-        )
+        logger.exception("Erreur job {} apres {:.1f}s".format(job_id, time.monotonic()-t0))
+        _update_job(r, job_id, status="error", finished_at=_now_iso(), error=str(e)[:500])
 
 # ==============================================================================
-#  Boucle principale
+#  11. BOUCLE WORKER ET MAIN
+#      Gestion du signal d arret, boucle BRPOP, initialisation.
 # ==============================================================================
+
+_shutdown = False
+
+def _on_signal(signum, frame):
+    global _shutdown
+    logger.info("Signal {} recu".format(signum))
+    _shutdown = True
+
+signal.signal(signal.SIGTERM, _on_signal)
+signal.signal(signal.SIGINT,  _on_signal)
 
 def main():
     logger.info("NEWS Scraper agent demarre")
-    logger.info("  DB_HOST    = {}".format(DB_HOST))
-    logger.info("  OLLAMA_HOST= {}".format(os.getenv("OLLAMA_HOST")))
-    logger.info("  REDIS_URL  = {}".format(REDIS_URL))
 
-    # Attente que les services dependants soient prets (evite boucle de crash
-    # au tout premier demarrage si redis/postgres sont plus lents).
     for attempt in range(10):
         try:
-            r = get_redis()
-            r.ping()
-            conn = get_db()
-            conn.close()
-            logger.info("Redis + PostgreSQL accessibles")
+            r = get_redis(); r.ping()
+            c = get_db();    c.close()
             break
         except Exception as e:
-            logger.warning("Dependance indisponible (tentative {}/10) : {}".format(
-                attempt + 1, e))
+            logger.warning("Dependances ({}/10) : {}".format(attempt+1, e))
             time.sleep(3)
     else:
-        logger.error("Impossible de joindre Redis ou PostgreSQL, arret")
+        logger.error("Impossible de joindre Redis ou PostgreSQL")
         return
 
-    logger.info("En attente de jobs sur '{}' (timeout BRPOP {}s)".format(
-        QUEUE_KEY, BRPOP_TIMEOUT_SEC))
+    _load_developer_names()
 
     r = get_redis()
 
     while not _shutdown:
         try:
-            # BRPOP bloque jusqu a BRPOP_TIMEOUT_SEC ; permet de reagir a SIGTERM
             pop = r.brpop(QUEUE_KEY, timeout=BRPOP_TIMEOUT_SEC)
             if pop is None:
-                continue  # timeout normal, on reboucle
+                continue
             _, job_id = pop
             process_job(r, job_id)
         except redis.ConnectionError as e:
-            logger.error("Perte connexion Redis : {} -- reconnexion dans 5s".format(e))
+            logger.error("Perte Redis : {} -- reconnexion 5s".format(e))
             time.sleep(5)
             r = get_redis()
         except Exception:
-            logger.exception("Erreur inattendue dans la boucle principale")
+            logger.exception("Erreur boucle principale")
             time.sleep(2)
 
-    logger.info("Agent arrete proprement")
+    logger.info("Agent arrete")
 
 if __name__ == "__main__":
     main()
