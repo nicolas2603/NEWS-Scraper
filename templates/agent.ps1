@@ -1436,17 +1436,42 @@ def consolidate_projects(projects: List[dict]) -> List[dict]:
 
     return consolidated
 
-_LLM_NAMES_SYSTEM = (
-    "Tu normalises des noms de projets ENR francais. "
-    "SUPPRIMER : communes, codes departement, puissances (MWc/MW), verbes admin "
-    "(Projet de, Creation d une, Realisation d un(e), Construction d un(e), Implantation). "
-    "CONSERVER : type de projet (Centrale PV / Centrale photovoltaique / Parc photovoltaique / "
-    "Parc eolien / Centrale eolienne / Projet agrivoltaique) + lieu-dit ou nom specifique si present. "
-    "FORMAT : 'Type' ou 'Type - Lieu-dit'. "
-    "Si le nom ne contient pas de type ENR reconnaissable, renvoie-le tel quel. "
-    "Reponds UNIQUEMENT avec {\"r\": [\"nom1\", \"nom2\", ...]} dans le meme ordre que l entree, "
-    "sans commentaire ni texte supplementaire."
-)
+_LLM_NAMES_SYSTEM = """
+    Tu normalises des noms de projets ENR français.
+    
+    REGLES :
+    - conserver EXACTEMENT le type de projet present dans le texte :
+      - centrale photovoltaique
+      - parc photovoltaique
+      - centrale eolienne
+      - parc eolien
+      - projet agrivoltaique
+    - NE JAMAIS remplacer "centrale" par "parc" ou inversement.
+    - supprimer :
+      - communes
+      - departements
+      - puissances
+      - formulations administratives
+    - conserver uniquement le lieu-dit ou nom specifique utile.
+    - format final :
+      - "Type"
+      - ou "Type - Lieu"
+    
+    EXEMPLES :
+    "Projet de realisation d’une centrale photovoltaique - Meillant - La Brande des Grands Cours"
+    -> "Centrale photovoltaique - La Brande des Grands Cours"
+    
+    "Projet de realisation d’un parc photovoltaïque - Saint-Germain-des-Bois - Les Neons"
+    -> "Parc photovoltaique - Les Neons"
+    
+    "Centrale photovoltaique a Chavannes (18)"
+    -> "Centrale photovoltaique"
+    
+    Si impossible, renvoyer le texte original.
+    
+    Répondre UNIQUEMENT avec :
+    {"r":["nom1","nom2"]}
+"""
 
 def _call_llm_names(names: List[str]) -> Optional[List[str]]:
     """Appel Ollama batch pour normaliser les noms de projets ENR.
@@ -1470,8 +1495,8 @@ def _call_llm_names(names: List[str]) -> Optional[List[str]]:
 				"keep_alive": "5m",
                 "options": {
                     "temperature": 0,
-                    "num_predict": 512,
-                    "num_ctx":    2048,
+                    "num_predict": 256,
+                    "num_ctx":    2048
                 },
             },
             timeout=OLLAMA_TIMEOUT_NAMES,
@@ -1499,6 +1524,22 @@ def _call_llm_names(names: List[str]) -> Optional[List[str]]:
         logger.warning("LLM noms echec : {}".format(e))
         return None
 
+def _clean_llm_name(text: str) -> str:
+    """Nettoyage léger avant envoi au LLM."""
+    if not text:
+        return ""
+
+    return (
+        text
+        .replace("“", '"')
+        .replace("”", '"')
+        .replace("’", "'")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("\u00A0", " ")   # espace insécable
+        .strip()
+    )
+
 def _apply_llm_names(projects: List[dict]) -> List[dict]:
     """Normalise les nom_projet de tous les projets via un seul appel LLM batch.
 
@@ -1513,7 +1554,10 @@ def _apply_llm_names(projects: List[dict]) -> List[dict]:
     if not projects:
         return projects
 
-    names_in  = [p.get("nom_projet") or "" for p in projects]
+    names_in = [
+	    _clean_llm_name(p.get("nom_projet") or "")
+	    for p in projects
+	]
     t0 = time.time()
     logger.info("  LLM noms : {} projets -> {}".format(len(names_in), OLLAMA_HOST))
 
@@ -1625,7 +1669,7 @@ def _build_project_summary(job_id: str, communes: List[dict]) -> List[dict]:
             dist_str = "{:.1f} km".format(dist_km)
 
         projects.append({
-            "nom_projet":     (cand.get("nom_projet") or "?")[:80],
+            "nom_projet":     (cand.get("nom_projet") or "?")[:300],
             "commune":        commune_nom,
             "distance":       dist_str,
             "puissance_mw":   cand.get("puissance_mw"),
